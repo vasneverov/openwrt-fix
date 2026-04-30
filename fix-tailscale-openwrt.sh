@@ -50,10 +50,54 @@ OLD=$(pgrep tailscaled 2>/dev/null); [ -n "$OLD" ] && kill "$OLD" 2>/dev/null &&
 tailscaled --tun=userspace-networking --statedir=/etc/tailscale/ >> /tmp/ts.log 2>&1 &
 sleep 5; tailscale up --accept-dns=false --accept-routes 2>&1
 
-echo ""; echo "══════════ РЕЗУЛЬТАТ ══════════"
-echo "fw_mode:     $(uci get tailscale.settings.fw_mode 2>/dev/null)"
-echo "rc.local:    $(grep -q tailscaled /etc/rc.local && echo OK || echo FAIL)"
-echo "ts-watchdog: $(crontab -l 2>/dev/null | grep -q ts-watchdog && echo OK || echo FAIL)"
-echo "pk-watchdog: $(crontab -l 2>/dev/null | grep -q podkop-watchdog && echo OK || echo FAIL)"
-echo "tailscale:   $(tailscale status 2>/dev/null | head -1)"
-echo "═══════════════════════════════"
+echo ""
+echo "╔══════════════════════════════════════╗"
+echo "║         РЕЗУЛЬТАТ УСТАНОВКИ          ║"
+echo "╚══════════════════════════════════════╝"
+echo ""
+
+FW=$(uci get tailscale.settings.fw_mode 2>/dev/null)
+if [ "$FW" = "none" ]; then
+  echo "  ✅ fw_mode = none"
+else
+  echo "  ❌ fw_mode = $FW (должно быть none)"
+fi
+
+if grep -q tailscaled /etc/rc.local 2>/dev/null; then
+  echo "  ✅ rc.local — автозапуск tailscaled"
+else
+  echo "  ❌ rc.local — tailscaled НЕ найден"
+fi
+
+if crontab -l 2>/dev/null | grep -q ts-watchdog; then
+  echo "  ✅ ts-watchdog — watchdog в crontab"
+else
+  echo "  ❌ ts-watchdog — отсутствует"
+fi
+
+if crontab -l 2>/dev/null | grep -q podkop-watchdog; then
+  echo "  ✅ podkop-watchdog — watchdog в crontab"
+else
+  echo "  ❌ podkop-watchdog — отсутствует"
+fi
+
+NTP=$(uci get podkop.settings.exclude_ntp 2>/dev/null)
+if [ "$NTP" = "1" ]; then
+  echo "  ✅ exclude_ntp = 1"
+else
+  echo "  ❌ exclude_ntp = $NTP (должно быть 1)"
+fi
+
+TS=$(tailscale status 2>/dev/null | head -1)
+if [ -n "$TS" ]; then
+  echo "  ✅ Tailscale online: $TS"
+  echo ""
+  echo "╔══════════════════════════════════════╗"
+  echo "║  🎉 Всё готово! SSH через Tailscale  ║"
+  echo "║     ssh root@<tailscale-ip>          ║"
+  echo "╚══════════════════════════════════════╝"
+else
+  echo "  ⏳ Tailscale поднимается... подождите 30-40 сек"
+  echo "     Затем: tailscale status"
+fi
+echo ""

@@ -6,18 +6,18 @@ echo ""; echo "╔════════════════════�
 echo "║   Tailscale + Podkop Repair Tool     ║"
 echo "╚══════════════════════════════════════╝"; echo ""
 
-echo "[1/5] fw_mode → none"
+echo "[1/6] fw_mode → none"
 uci set tailscale.settings.fw_mode='none' 2>/dev/null
 uci commit tailscale 2>/dev/null
 
-echo "[2/5] podkop: exclude_ntp=1, mixed_proxy=0"
+echo "[2/6] podkop: exclude_ntp=1, mixed_proxy=0"
 uci set podkop.settings.exclude_ntp='1' 2>/dev/null
 uci set podkop.main.exclude_ntp='1' 2>/dev/null
 uci set podkop.main.mixed_proxy_enabled='0' 2>/dev/null
 uci set podkop.YT.mixed_proxy_enabled='0' 2>/dev/null
 uci commit podkop 2>/dev/null
 
-echo "[3/5] rc.local → userspace-networking"
+echo "[3/6] rc.local → userspace-networking"
 cat > /etc/rc.local << 'RCEOF'
 #!/bin/sh
 (sleep 40
@@ -30,7 +30,7 @@ exit 0
 RCEOF
 chmod +x /etc/rc.local; cp /etc/rc.local /etc/rc.local.bak
 
-echo "[4/5] watchdog"
+echo "[4/6] watchdog"
 cat > /etc/ts-watchdog.sh << 'WEOF'
 #!/bin/sh
 grep -q tailscaled /etc/rc.local 2>/dev/null || cp /etc/rc.local.bak /etc/rc.local
@@ -44,7 +44,12 @@ PEOF
 chmod +x /etc/podkop-watchdog.sh
 (crontab -l 2>/dev/null | grep -v watchdog; echo "*/3 * * * * /etc/ts-watchdog.sh"; echo "*/5 * * * * /etc/podkop-watchdog.sh") | crontab -
 
-echo "[5/5] Tailscale → перезапуск"
+echo "[5/6] firewall → tailscale0 в LAN зону"
+uci set firewall.@zone[0].device='br-lan tailscale0' 2>/dev/null
+uci commit firewall 2>/dev/null
+/etc/init.d/firewall reload 2>/dev/null
+
+echo "[6/6] Tailscale → перезапуск"
 /etc/init.d/tailscale disable 2>/dev/null; true
 OLD=$(pgrep tailscaled 2>/dev/null); [ -n "$OLD" ] && kill "$OLD" 2>/dev/null && sleep 3
 tailscaled --tun=userspace-networking --statedir=/etc/tailscale/ >> /tmp/ts.log 2>&1 &
@@ -79,6 +84,13 @@ if crontab -l 2>/dev/null | grep -q podkop-watchdog; then
   echo "  ✅ podkop-watchdog — watchdog в crontab"
 else
   echo "  ❌ podkop-watchdog — отсутствует"
+fi
+
+FW_DEV=$(uci get firewall.@zone[0].device 2>/dev/null)
+if echo "$FW_DEV" | grep -q tailscale0; then
+  echo "  ✅ firewall — tailscale0 в LAN зоне"
+else
+  echo "  ❌ firewall — tailscale0 НЕ в LAN зоне"
 fi
 
 NTP=$(uci get podkop.settings.exclude_ntp 2>/dev/null)

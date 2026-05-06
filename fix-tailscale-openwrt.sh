@@ -33,15 +33,37 @@ chmod +x /etc/rc.local; cp /etc/rc.local /etc/rc.local.bak
 echo "[4/6] watchdog"
 cat > /etc/ts-watchdog.sh << 'WEOF'
 #!/bin/sh
-grep -q tailscaled /etc/rc.local 2>/dev/null || cp /etc/rc.local.bak /etc/rc.local
-ps | grep -q "tailscaled --tun" || (sleep 5; tailscaled --tun=userspace-networking --statedir=/etc/tailscale/ >> /tmp/ts.log 2>&1 & sleep 5; tailscale up --accept-dns=false --accept-routes) &
+RC_BACKUP="/etc/rc.local.bak"
+if [ ! -f "$RC_BACKUP" ]; then exit 1; fi
+if ! grep -q "tailscaled" /etc/rc.local 2>/dev/null; then
+    cp "$RC_BACKUP" /etc/rc.local
+fi
+if ! ps | grep -q "tailscaled --state="; then
+    (sleep 5; /usr/sbin/tailscaled --state=/etc/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >> /tmp/ts.log 2>&1 & sleep 5; tailscale up --accept-dns=false --accept-routes) &
+fi
 WEOF
 chmod +x /etc/ts-watchdog.sh
+
 cat > /etc/podkop-watchdog.sh << 'PEOF'
 #!/bin/sh
-ps | grep -q "sing-box" || /etc/init.d/podkop restart
+if ! ps | grep -q "sing-box run"; then
+    logger -t podkop-watchdog "sing-box not running, restarting podkop"
+    /etc/init.d/podkop restart
+fi
 PEOF
 chmod +x /etc/podkop-watchdog.sh
+
+cat > /etc/route-watchdog.sh << 'REOF'
+#!/bin/sh
+# Восстановление маршрутов FakeIP при их потере
+# sing-box с fakeip требует маршрут 198.18.0.0/15
+if ! ip route | grep -q "198.18.0.0/15"; then
+    logger -t route-watchdog "Restoring FakeIP routes"
+    ip route add 198.18.0.0/15 dev br-lan 2>/dev/null || true
+fi
+REOF
+chmod +x /etc/route-watchdog.sh
+
 (crontab -l 2>/dev/null | grep -v watchdog; echo "*/2 * * * * /etc/ts-watchdog.sh"; echo "*/2 * * * * /etc/podkop-watchdog.sh"; echo "*/2 * * * * /etc/route-watchdog.sh") | crontab -
 
 echo "[5/6] firewall → tailscale0 в LAN зону"
@@ -52,7 +74,7 @@ uci commit firewall 2>/dev/null
 echo "[6/6] Tailscale → перезапуск"
 /etc/init.d/tailscale disable 2>/dev/null; true
 OLD=$(pgrep tailscaled 2>/dev/null); [ -n "$OLD" ] && kill "$OLD" 2>/dev/null && sleep 3
-tailscaled --tun=userspace-networking --statedir=/etc/tailscale/ >> /tmp/ts.log 2>&1 &
+/usr/sbin/tailscaled --state=/etc/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >> /tmp/ts.log 2>&1 &
 sleep 5; tailscale up --accept-dns=false --accept-routes 2>&1
 
 echo ""
@@ -75,15 +97,21 @@ else
 fi
 
 if crontab -l 2>/dev/null | grep -q ts-watchdog; then
-  echo "  ✅ ts-watchdog — watchdog в crontab"
+  echo "  ✅ ts-watchdog — в crontab (каждые 2 мин)"
 else
   echo "  ❌ ts-watchdog — отсутствует"
 fi
 
 if crontab -l 2>/dev/null | grep -q podkop-watchdog; then
-  echo "  ✅ podkop-watchdog — watchdog в crontab"
+  echo "  ✅ podkop-watchdog — в crontab (каждые 2 мин)"
 else
   echo "  ❌ podkop-watchdog — отсутствует"
+fi
+
+if crontab -l 2>/dev/null | grep -q route-watchdog; then
+  echo "  ✅ route-watchdog — в crontab (каждые 2 мин)"
+else
+  echo "  ❌ route-watchdog — отсутствует"
 fi
 
 FW_DEV=$(uci get firewall.@zone[0].device 2>/dev/null)

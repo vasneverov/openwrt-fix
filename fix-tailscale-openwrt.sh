@@ -21,6 +21,33 @@
 set -e
 
 # =============================================================================
+# Определение версии OpenWrt
+# =============================================================================
+OPENWRT_RELEASE=$(cat /etc/openwrt_release 2>/dev/null | grep -o 'DISTRIB_RELEASE=' | head -1)
+OPENWRT_VERSION=$(cat /etc/openwrt_release 2>/dev/null | grep 'DISTRIB_RELEASE' | cut -d"'" -f2)
+OPENWRT_MAJOR=$(echo "$OPENWRT_VERSION" | cut -d'.' -f1)
+OPENWRT_MINOR=$(echo "$OPENWRT_VERSION" | cut -d'.' -f2)
+
+if [ -z "$OPENWRT_VERSION" ]; then
+    OPENWRT_VERSION="unknown"
+    OPENWRT_MAJOR="0"
+    OPENWRT_MINOR="0"
+fi
+
+# Определяем тип firewall
+# 24.10 → fw3 (iptables), 25.12 → fw4 (nftables)
+if [ "$OPENWRT_MAJOR" -ge 25 ] 2>/dev/null; then
+    FW_TYPE="fw4"
+    FW_VERB="nftables"
+elif [ "$OPENWRT_MAJOR" -eq 24 ] && [ "$OPENWRT_MINOR" -ge 10 ] 2>/dev/null; then
+    FW_TYPE="fw4"
+    FW_VERB="nftables"
+else
+    FW_TYPE="fw3"
+    FW_VERB="iptables"
+fi
+
+# =============================================================================
 # Шаг 0: Заголовок
 # =============================================================================
 echo ""
@@ -30,6 +57,9 @@ echo "║   Tailscale НЕ ТРОГАЕМ • Podkop НЕ РЕСТАРТИМ    
 echo "║   firewall НЕ reload • reboot НЕ ДЕЛАЕМ         ║"
 echo "╚══════════════════════════════════════════════════╝"
 echo ""
+echo "  OpenWrt: $OPENWRT_VERSION • Firewall: $FW_TYPE ($FW_VERB)"
+echo ""
+
 
 # =============================================================================
 # Шаг 1: Tailscale fw_mode → none
@@ -241,23 +271,28 @@ chmod +x /usr/bin/check-ip
 echo "  ✅ /usr/bin/check-ip создан"
 
 # =============================================================================
-# Шаг 10: Установка podkop-fw4-fix
+# Шаг 10: Установка podkop-fw4-fix (только для fw4/nftables)
 # =============================================================================
 echo "━━━ [10/13] podkop-fw4-fix ━━━"
-# Скачиваем с GitHub
-wget -q -O /root/podkop-fw4-fix.sh \
-  'https://raw.githubusercontent.com/vasneverov/openwrt-scripts/main/tools/podkop-fw4-fix.sh' 2>/dev/null || \
-curl -sL -o /root/podkop-fw4-fix.sh \
-  'https://raw.githubusercontent.com/vasneverov/openwrt-scripts/main/tools/podkop-fw4-fix.sh' 2>/dev/null || \
-  echo "  ⚠️  Не удалось скачать podkop-fw4-fix.sh"
+if [ "$FW_TYPE" = "fw4" ]; then
+    echo "  🔧 OpenWrt $OPENWRT_VERSION (fw4/nftables) — устанавливаю fw4-fix"
+    wget -q -O /root/podkop-fw4-fix.sh \
+      'https://raw.githubusercontent.com/vasneverov/openwrt-scripts/main/tools/podkop-fw4-fix.sh' 2>/dev/null || \
+    curl -sL -o /root/podkop-fw4-fix.sh \
+      'https://raw.githubusercontent.com/vasneverov/openwrt-scripts/main/tools/podkop-fw4-fix.sh' 2>/dev/null || \
+      echo "  ⚠️  Не удалось скачать podkop-fw4-fix.sh"
 
-if [ -f /root/podkop-fw4-fix.sh ]; then
-    chmod +x /root/podkop-fw4-fix.sh
-    sh /root/podkop-fw4-fix.sh install 2>&1 | head -5
-    echo "  ✅ podkop-fw4-fix установлен"
+    if [ -f /root/podkop-fw4-fix.sh ]; then
+        chmod +x /root/podkop-fw4-fix.sh
+        sh /root/podkop-fw4-fix.sh install 2>&1 | head -5
+        echo "  ✅ podkop-fw4-fix установлен"
+    else
+        echo "  ⚠️  podkop-fw4-fix.sh не найден, пропускаем"
+    fi
 else
-    echo "  ⚠️  podkop-fw4-fix.sh не найден, пропускаем"
+    echo "  ⏭️  OpenWrt $OPENWRT_VERSION (fw3/iptables) — fw4-fix не требуется"
 fi
+
 
 # =============================================================================
 # Шаг 11: Установка podkop-fix-lists
@@ -278,23 +313,33 @@ else
 fi
 
 # =============================================================================
-# Шаг 12: Проверка nftables (PodkopTable жива?)
+# Шаг 12: Проверка firewall (PodkopTable жива?)
 # =============================================================================
-echo "━━━ [12/13] Проверка nftables ━━━"
-if nft list table inet PodkopTable >/dev/null 2>&1; then
-    echo "  ✅ PodkopTable — жива"
-    # Проверим счётчики
-    nft list chain inet PodkopTable mangle 2>/dev/null | grep -c "counter packets" || true
+echo "━━━ [12/13] Проверка firewall ━━━"
+if [ "$FW_TYPE" = "fw4" ]; then
+    # fw4/nftables — проверяем PodkopTable
+    if nft list table inet PodkopTable >/dev/null 2>&1; then
+        echo "  ✅ PodkopTable (nftables) — жива"
+        nft list chain inet PodkopTable mangle 2>/dev/null | grep -c "counter packets" || true
+    else
+        echo "  ⚠️  PodkopTable отсутствует! Нужен /etc/init.d/podkop restart"
+    fi
+
+    # Проверим fw4-fix правила
+    if nft list chain inet fw4 mangle_forward 2>/dev/null | grep -q "podkop-fw4-fix"; then
+        echo "  ✅ fw4-fix правила — есть"
+    else
+        echo "  ⚠️  fw4-fix правила отсутствуют"
+    fi
 else
-    echo "  ⚠️  PodkopTable отсутствует! Нужен /etc/init.d/podkop restart"
+    # fw3/iptables — проверяем правила маркировки
+    if iptables -t mangle -L PREROUTING 2>/dev/null | grep -q "Podkop"; then
+        echo "  ✅ Podkop правила (iptables) — есть"
+    else
+        echo "  ⚠️  Podkop правила в iptables не найдены"
+    fi
 fi
 
-# Проверим fw4-fix правила
-if nft list chain inet fw4 mangle_forward 2>/dev/null | grep -q "podkop-fw4-fix"; then
-    echo "  ✅ fw4-fix правила — есть"
-else
-    echo "  ⚠️  fw4-fix правила отсутствуют"
-fi
 
 # =============================================================================
 # Шаг 13: Финальная диагностика

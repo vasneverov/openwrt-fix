@@ -171,18 +171,30 @@ REOF
 chmod +x /etc/route-watchdog.sh
 echo "  ✅ route-watchdog.sh"
 
+# 5d. List watchdog — будит листового агента при блокировке GitHub CDN
+cat > /etc/list-watchdog.sh << 'LEOF'
+#!/bin/sh
+# Спит пока GitHub CDN доступен. Просыпается при блокировке — запускает листового агента.
+wget -q --timeout=5 -O /dev/null "https://raw.githubusercontent.com/nicehash/NiceHashQuickMiner/master/README.md" 2>/dev/null \
+  && exit 0
+/etc/podkop-fix-lists.sh --cron 2>/dev/null || true
+LEOF
+chmod +x /etc/list-watchdog.sh
+echo "  ✅ list-watchdog.sh"
+
 # =============================================================================
 # Шаг 6: Crontab
 # =============================================================================
 echo "━━━ [6/13] Crontab ━━━"
 (
-    crontab -l 2>/dev/null | grep -v -E "(ts-watchdog|podkop-watchdog|route-watchdog|list_update)"
+    crontab -l 2>/dev/null | grep -v -E "(ts-watchdog|podkop-watchdog|route-watchdog|list_update|list-watchdog)"
     echo "*/2 * * * * /etc/ts-watchdog.sh"
     echo "*/2 * * * * /etc/podkop-watchdog.sh"
     echo "*/2 * * * * /etc/route-watchdog.sh"
+    echo "*/30 * * * * /etc/list-watchdog.sh"
     echo "13 */3 * * * /usr/bin/podkop list_update"
 ) | crontab -
-echo "  ✅ crontab обновлён (3 watchdog'а + list_update)"
+echo "  ✅ crontab обновлён (4 watchdog'а + list_update)"
 
 # ── Tailscale полностью защищён ─────────────────────────────────────────────
 

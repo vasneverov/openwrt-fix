@@ -86,9 +86,110 @@ else
 fi
 
 # =============================================================================
-# Шаг 3: WAN ifname (podkop использует ifname, а не device)
+# Шаг 3: rc.local с tailscaled (userspace-networking)
 # =============================================================================
-echo "━━━ [3/13] WAN ifname ━━━"
+echo "━━━ [3/13] rc.local ━━━"
+if [ -f /etc/rc.local ] && grep -q "tailscaled" /etc/rc.local 2>/dev/null; then
+    echo "  ✅ rc.local уже содержит tailscaled"
+else
+    [ -f /etc/rc.local ] && cp /etc/rc.local /etc/rc.local.bak 2>/dev/null
+
+    cat > /etc/rc.local << 'EOF'
+#!/bin/sh
+(sleep 40
+tailscaled --tun=userspace-networking --statedir=/etc/tailscale/ >> /tmp/ts.log 2>&1 &
+sleep 5
+tailscale up --accept-dns=false --accept-routes
+sleep 10
+logger -t rc.local 'tailscale up applied') &
+exit 0
+EOF
+    chmod +x /etc/rc.local
+    cp /etc/rc.local /etc/rc.local.bak
+    echo "  ✅ rc.local создан"
+fi
+
+# =============================================================================
+# Шаг 4: firewall → tailscale0 в LAN зону (БЕЗ reload!)
+# =============================================================================
+echo "━━━ [4/13] firewall → tailscale0 в LAN зону ━━━"
+echo "  ⚠️  firewall НЕ перезагружаем! (сохраняем конфиг)"
+CURRENT_DEV=$(uci get firewall.@zone[0].device 2>/dev/null)
+if echo "$CURRENT_DEV" | grep -q "tailscale0"; then
+    echo "  ✅ tailscale0 уже в LAN зоне"
+else
+    uci set firewall.@zone[0].device='br-lan tailscale0' 2>/dev/null
+    uci commit firewall 2>/dev/null
+    echo "  ✅ tailscale0 добавлен в LAN зону (конфиг сохранён, reload НЕ делали)"
+fi
+
+# =============================================================================
+# Шаг 5: Три watchdog'а (каждые 2 минуты)
+# =============================================================================
+echo "━━━ [5/13] Watchdog'ы (3 шт, каждые 2 мин) ━━━"
+
+# 5a. Tailscale watchdog — восстанавливает rc.local и tailscaled
+cat > /etc/ts-watchdog.sh << 'WEOF'
+#!/bin/sh
+RC_BACKUP="/etc/rc.local.bak"
+if [ ! -f "$RC_BACKUP" ]; then exit 1; fi
+if ! grep -q "tailscaled" /etc/rc.local 2>/dev/null; then
+    cp "$RC_BACKUP" /etc/rc.local
+fi
+if ! ps | grep -q "tailscaled --statedir="; then
+    (sleep 5; tailscaled --tun=userspace-networking --statedir=/etc/tailscale/ >> /tmp/ts.log 2>&1 & sleep 5; tailscale up --accept-dns=false --accept-routes) &
+fi
+WEOF
+chmod +x /etc/ts-watchdog.sh
+echo "  ✅ ts-watchdog.sh"
+
+# 5b. Podkop watchdog — перезапускает sing-box если упал
+cat > /etc/podkop-watchdog.sh << 'PEOF'
+#!/bin/sh
+if ! ps | grep -q "sing-box run"; then
+    logger -t podkop-watchdog "sing-box not running, restarting podkop"
+    /etc/init.d/podkop restart
+fi
+PEOF
+chmod +x /etc/podkop-watchdog.sh
+echo "  ✅ podkop-watchdog.sh"
+
+# 5c. Route watchdog — восстанавливает FakeIP маршруты
+cat > /etc/route-watchdog.sh << 'REOF'
+#!/bin/sh
+# Восстановление маршрутов FakeIP (198.18.0.0/15)
+if ! ip route | grep -q "198.18.0.0/15"; then
+    logger -t route-watchdog "Restoring FakeIP routes"
+    ip route add 198.18.0.0/15 dev br-lan 2>/dev/null || true
+fi
+# Проверка PodkopTable в nftables
+nft list table inet PodkopTable >/dev/null 2>&1 || {
+    logger -t route-watchdog "PodkopTable missing, restarting podkop"
+    /etc/init.d/podkop restart
+}
+REOF
+chmod +x /etc/route-watchdog.sh
+echo "  ✅ route-watchdog.sh"
+
+# =============================================================================
+# Шаг 6: Crontab
+# =============================================================================
+echo "━━━ [6/13] Crontab ━━━"
+(
+    crontab -l 2>/dev/null | grep -v -E "(ts-watchdog|podkop-watchdog|route-watchdog|list_update)"
+    echo "*/2 * * * * /etc/ts-watchdog.sh"
+    echo "*/2 * * * * /etc/podkop-watchdog.sh"
+    echo "*/2 * * * * /etc/route-watchdog.sh"
+    echo "13 */3 * * * /usr/bin/podkop list_update"
+) | crontab -
+echo "  ✅ crontab обновлён (3 watchdog'а + list_update)"
+
+# ── Tailscale полностью защищён ─────────────────────────────────────────────
+
+# =============================================================================
+# Шаг 7: WAN ifname (podkop использует ifname, а не device)
+# =============================================================================
+echo "━━━ [7/13] WAN ifname ━━━"
 WAN_IFNAME=$(uci get network.wan.ifname 2>/dev/null)
 if [ -z "$WAN_IFNAME" ]; then
     WAN_DEVICE=$(uci get network.wan.device 2>/dev/null)
@@ -104,9 +205,9 @@ else
 fi
 
 # =============================================================================
-# Шаг 4: Podkop настройки (exclude_ntp, enable_output, mixed_proxy)
+# Шаг 8: Podkop настройки (exclude_ntp, enable_output, mixed_proxy)
 # =============================================================================
-echo "━━━ [4/13] Podkop настройки ━━━"
+echo "━━━ [8/13] Podkop настройки ━━━"
 
 CURRENT_NTP=$(uci get podkop.settings.exclude_ntp 2>/dev/null)
 if [ "$CURRENT_NTP" != "1" ]; then
@@ -136,106 +237,6 @@ for profile in main YT; do
 done
 
 uci commit podkop
-
-# =============================================================================
-# Шаг 5: rc.local с tailscaled (userspace-networking)
-# =============================================================================
-echo "━━━ [5/13] rc.local ━━━"
-if [ -f /etc/rc.local ] && grep -q "tailscaled" /etc/rc.local 2>/dev/null; then
-    echo "  ✅ rc.local уже содержит tailscaled"
-else
-    # Сохраняем бэкап если есть
-    [ -f /etc/rc.local ] && cp /etc/rc.local /etc/rc.local.bak 2>/dev/null
-    
-    cat > /etc/rc.local << 'EOF'
-#!/bin/sh
-(sleep 40
-tailscaled --tun=userspace-networking --statedir=/etc/tailscale/ >> /tmp/ts.log 2>&1 &
-sleep 5
-tailscale up --accept-dns=false --accept-routes
-sleep 10
-logger -t rc.local 'tailscale up applied') &
-exit 0
-EOF
-    chmod +x /etc/rc.local
-    cp /etc/rc.local /etc/rc.local.bak
-    echo "  ✅ rc.local создан"
-fi
-
-# =============================================================================
-# Шаг 6: firewall → tailscale0 в LAN зону (БЕЗ reload!)
-# =============================================================================
-echo "━━━ [6/13] firewall → tailscale0 в LAN зону ━━━"
-echo "  ⚠️  firewall НЕ перезагружаем! (сохраняем конфиг)"
-CURRENT_DEV=$(uci get firewall.@zone[0].device 2>/dev/null)
-if echo "$CURRENT_DEV" | grep -q "tailscale0"; then
-    echo "  ✅ tailscale0 уже в LAN зоне"
-else
-    uci set firewall.@zone[0].device='br-lan tailscale0' 2>/dev/null
-    uci commit firewall 2>/dev/null
-    echo "  ✅ tailscale0 добавлен в LAN зону (конфиг сохранён, reload НЕ делали)"
-fi
-
-# =============================================================================
-# Шаг 7: Три watchdog'а (каждые 2 минуты)
-# =============================================================================
-echo "━━━ [7/13] Watchdog'ы (3 шт, каждые 2 мин) ━━━"
-
-# 7a. Tailscale watchdog — восстанавливает rc.local и tailscaled
-cat > /etc/ts-watchdog.sh << 'WEOF'
-#!/bin/sh
-RC_BACKUP="/etc/rc.local.bak"
-if [ ! -f "$RC_BACKUP" ]; then exit 1; fi
-if ! grep -q "tailscaled" /etc/rc.local 2>/dev/null; then
-    cp "$RC_BACKUP" /etc/rc.local
-fi
-if ! ps | grep -q "tailscaled --statedir="; then
-    (sleep 5; tailscaled --tun=userspace-networking --statedir=/etc/tailscale/ >> /tmp/ts.log 2>&1 & sleep 5; tailscale up --accept-dns=false --accept-routes) &
-fi
-WEOF
-chmod +x /etc/ts-watchdog.sh
-echo "  ✅ ts-watchdog.sh"
-
-# 7b. Podkop watchdog — перезапускает sing-box если упал
-cat > /etc/podkop-watchdog.sh << 'PEOF'
-#!/bin/sh
-if ! ps | grep -q "sing-box run"; then
-    logger -t podkop-watchdog "sing-box not running, restarting podkop"
-    /etc/init.d/podkop restart
-fi
-PEOF
-chmod +x /etc/podkop-watchdog.sh
-echo "  ✅ podkop-watchdog.sh"
-
-# 7c. Route watchdog — восстанавливает FakeIP маршруты
-cat > /etc/route-watchdog.sh << 'REOF'
-#!/bin/sh
-# Восстановление маршрутов FakeIP (198.18.0.0/15)
-if ! ip route | grep -q "198.18.0.0/15"; then
-    logger -t route-watchdog "Restoring FakeIP routes"
-    ip route add 198.18.0.0/15 dev br-lan 2>/dev/null || true
-fi
-# Проверка PodkopTable в nftables
-nft list table inet PodkopTable >/dev/null 2>&1 || {
-    logger -t route-watchdog "PodkopTable missing, restarting podkop"
-    /etc/init.d/podkop restart
-}
-REOF
-chmod +x /etc/route-watchdog.sh
-echo "  ✅ route-watchdog.sh"
-
-# =============================================================================
-# Шаг 8: Crontab
-# =============================================================================
-echo "━━━ [8/13] Crontab ━━━"
-(
-    crontab -l 2>/dev/null | grep -v -E "(ts-watchdog|podkop-watchdog|route-watchdog|list_update)"
-    echo "*/2 * * * * /etc/ts-watchdog.sh"
-    echo "*/2 * * * * /etc/podkop-watchdog.sh"
-    echo "*/2 * * * * /etc/route-watchdog.sh"
-    echo "13 */3 * * * /usr/bin/podkop list_update"
-) | crontab -
-echo "  ✅ crontab обновлён (3 watchdog'а + list_update)"
 
 # =============================================================================
 # Шаг 9: check-ip скрипт диагностики
@@ -317,7 +318,6 @@ fi
 # =============================================================================
 echo "━━━ [12/13] Проверка firewall ━━━"
 if [ "$FW_TYPE" = "fw4" ]; then
-    # fw4/nftables — проверяем PodkopTable
     if nft list table inet PodkopTable >/dev/null 2>&1; then
         echo "  ✅ PodkopTable (nftables) — жива"
         nft list chain inet PodkopTable mangle 2>/dev/null | grep -c "counter packets" || true
@@ -325,14 +325,12 @@ if [ "$FW_TYPE" = "fw4" ]; then
         echo "  ⚠️  PodkopTable отсутствует! Нужен /etc/init.d/podkop restart"
     fi
 
-    # Проверим fw4-fix правила
     if nft list chain inet fw4 mangle_forward 2>/dev/null | grep -q "podkop-fw4-fix"; then
         echo "  ✅ fw4-fix правила — есть"
     else
         echo "  ⚠️  fw4-fix правила отсутствуют"
     fi
 else
-    # fw3/iptables — проверяем правила маркировки
     if iptables -t mangle -L PREROUTING 2>/dev/null | grep -q "Podkop"; then
         echo "  ✅ Podkop правила (iptables) — есть"
     else

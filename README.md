@@ -9,172 +9,103 @@ sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix
 
 ## 📋 Что делает этот скрипт
 
-Этот скрипт полностью восстанавливает работоспособность роутера с OpenWrt после сбоев, обновлений или при первичной настройке. Он настраивает **Tailscale для удалённого доступа** и **Podkop (sing-box) для обхода блокировок**.
+Универсальное восстановление роутера OpenWrt после сбоев, обновлений или при первичной настройке. Настраивает **Tailscale для удалённого доступа** и **Podkop (sing-box) для обхода блокировок**.
+
+**Железные правила скрипта:**
+- ❌ Tailscale НЕ перезагружаем (оборвётся SSH)
+- ❌ Podkop НЕ рестартим (может сломать маршрутизацию)
+- ❌ firewall НЕ reload (сбросит правила Tailscale)
+- ❌ reboot НЕ делаем
 
 ---
 
-## 🎯 Шаги выполнения и тонкости
+## 🎯 Порядок выполнения
 
-### Шаг 1: `fw_mode → none` (Tailscale)
+### Принцип: сначала Tailscale, потом всё остальное
+
+Первые 6 шагов полностью защищают Tailscale. Только после этого трогается Podkop.
+Причина: `set -e` — при любой ошибке скрипт остановится. Если Podkop-команды упадут раньше, чем записан rc.local, роутер потеряет Tailscale после ребута навсегда.
+
+---
+
+### Шаг 1: `fw_mode → none`
+
 ```bash
 uci set tailscale.settings.fw_mode='none'
 ```
 
-**Что делает:** Отключает управление firewall со стороны Tailscale.
+Tailscale в режиме `nftables` перезаписывает таблицы firewall и уничтожает `PodkopTable`. Режим `none` запрещает Tailscale трогать firewall.
 
-**Почему это важно:**
-- Стандартный режим `fw_mode=nftables` перезаписывает nftables-правила Podkop
-- Это приводит к потере VPN-трафика — sing-box перестаёт перехватывать пакеты
-- `none` = Tailscale не трогает firewall, оставляя правила Podkop нетронутыми
-
-**Что на что влияет:**
 | fw_mode | Результат |
 |---------|-----------|
-| `nftables` | ❌ PodkopTable в nftables затирается, VPN не работает |
+| `nftables` | ❌ PodkopTable затирается, VPN не работает |
 | `none` | ✅ PodkopTable сохраняется, VPN работает |
 
 ---
 
-### Шаг 2: Настройки Podkop
+### Шаг 2: `init.d/tailscale → DISABLED`
+
 ```bash
-uci set podkop.settings.exclude_ntp='1'
-uci set podkop.main.exclude_ntp='1'
-uci set podkop.main.mixed_proxy_enabled='0'
-uci set podkop.YT.mixed_proxy_enabled='0'
+/etc/init.d/tailscale disable
 ```
 
-**Что делает:**
-- `exclude_ntp=1` — исключает NTP-трафик из VPN-туннеля
-- `mixed_proxy_enabled=0` — отключает mixed proxy (используется только для скачивания списков при блокировке GitHub)
-
-**Почему это важно:**
-
-**NTP (exclude_ntp=1):**
-- При `exclude_ntp=0` NTP-запросы идут через sing-box
-- sing-box с fakeIP может кэшировать DNS-ответы с "завтрашним" временем
-- Роутер получает неправильное время → сертификаты TLS становятся недействительными → HTTPS ломается везде
-
-**mixed_proxy:**
-- Включается только временно для скачивания .srs-списков с GitHub при блокировке
-- Обычно должен быть `0`, иначе создаётся лишний прокси-порт
-
-**Что на что влияет:**
-| exclude_ntp | Результат |
-|-------------|-----------|
-| `0` | ❌ Часы дрейфуют, HTTPS ломается |
-| `1` | ✅ NTP ходит напрямую, время стабильно |
+Системный init.d запускает Tailscale в kernel-mode, который при каждом старте сбрасывает `PodkopTable`. Отключаем навсегда — запуском управляет rc.local из шага 3.
 
 ---
 
-### Шаг 3: rc.local — автозапуск Tailscale
+### Шаг 3: `rc.local` — автозапуск Tailscale через ребут
+
 ```bash
-cat > /etc/rc.local << 'RCEOF'
+cat > /etc/rc.local << 'EOF'
 #!/bin/sh
 (sleep 40
-tailscaled --tun=userspace-networking --statedir=/etc/tailscale/
+tailscaled --tun=userspace-networking --statedir=/etc/tailscale/ >> /tmp/ts.log 2>&1 &
 sleep 5
-tailscale up --accept-dns=false --accept-routes) &
+tailscale up --accept-dns=false --accept-routes
+sleep 10
+logger -t rc.local 'tailscale up applied') &
 exit 0
+EOF
 ```
 
-**Что делает:** Создаёт скрипт автозапуска Tailscale при загрузке роутера.
+Записывает правильный запуск в `/etc/rc.local` и сохраняет бэкап в `/etc/rc.local.bak`.
 
 **Ключевые параметры:**
-- `--tun=userspace-networking` — userspace-режим (не требует TUN-модуль ядра)
-- `--statedir=/etc/tailscale/` — директория для состояния
-- `sleep 40` — ждёт инициализации системы (сеть, DNS)
-- `--accept-dns=false` — не меняет DNS настройки роутера
-- `--accept-routes` — принимать маршруты из Tailscale network
-
-**Почему userspace-networking:**
-- OpenWrt на многих роутерах не поддерживает TUN-модуль
-- Userspace работает везде, но немного медленнее
-- Без этого параметра Tailscale не запустится
-
-**Бэкап rc.local:**
-```bash
-cp /etc/rc.local /etc/rc.local.bak
-```
-Создаёт резервную копию для восстановления watchdog-ом.
+- `--tun=userspace-networking` — работает без TUN-модуля ядра, совместим со всеми роутерами
+- `--statedir=/etc/tailscale/` — персистентная папка (не `/var/lib`, которая в RAM и стирается при ребуте)
+- `sleep 40` — ждёт пока система поднимет сеть и DNS
+- `--accept-dns=false` — не меняет DNS роутера
 
 ---
 
-### Шаг 4: Три watchdog-скрипта (*/2 минуты)
+### Шаг 4: `tailscale0 → LAN зона` (без reload!)
 
-#### 4.1 `/etc/ts-watchdog.sh` — защита Tailscale
 ```bash
-#!/bin/sh
-RC_BACKUP="/etc/rc.local.bak"
-if [ ! -f "$RC_BACKUP" ]; then exit 1; fi
-
-# Восстановление rc.local если он был повреждён
-if ! grep -q "tailscaled" /etc/rc.local 2>/dev/null; then
-    cp "$RC_BACKUP" /etc/rc.local
-fi
-
-# Перезапуск tailscaled если процесс упал
-if ! ps | grep -q "tailscaled --state="; then
-    (sleep 5; /usr/sbin/tailscaled --state=/etc/tailscale/tailscaled.state \
-        --socket=/var/run/tailscale/tailscaled.sock & sleep 5; \
-        tailscale up --accept-dns=false --accept-routes) &
-fi
+uci set firewall.@zone[0].device='br-lan tailscale0'
+uci commit firewall
 ```
 
-**Что проверяет:**
-1. Наличие `rc.local.bak` — если нет, выходит (система не готова)
-2. Целостность `/etc/rc.local` — если tailscaled пропал из файла, восстанавливает из бэкапа
-3. Процесс `tailscaled` — если упал, перезапускает
-
-**Задержка 5 секунд** перед запуском — даёт время системе стабилизироваться.
+Без этого SSH и LuCI недоступны через Tailscale-IP. Добавляет `tailscale0` в LAN-зону только через UCI — без `fw reload`, который сбросил бы правила Podkop.
 
 ---
 
-#### 4.2 `/etc/podkop-watchdog.sh` — защита Podkop/sing-box
-```bash
-#!/bin/sh
-if ! ps | grep -q "sing-box run"; then
-    logger -t podkop-watchdog "sing-box not running, restarting podkop"
-    /etc/init.d/podkop restart
-fi
-```
+### Шаг 5: Три watchdog-скрипта
 
-**Что проверяет:**
-- Процесс `sing-box run` — основной процесс VPN
+Все три запускаются cron каждые 2 минуты.
 
-**Что делает при падении:**
-- Перезапускает весь `/etc/init.d/podkop` через init.d
-- Это пересоздаёт nftables-правила и перезапускает sing-box
+**`/etc/ts-watchdog.sh` — защита Tailscale:**
+1. Если `/etc/rc.local` повреждён — восстанавливает из `/etc/rc.local.bak`
+2. Если процесс `tailscaled` упал — перезапускает
 
-**Почему важен:**
-- sing-box может упасть при OOM (нехватке памяти)
-- После падения правила nftables остаются, но не работают без процесса
-- Без watchdog трафик уходит в никуда (чёрная дыра)
+**`/etc/podkop-watchdog.sh` — защита sing-box:**
+- Если процесс `sing-box run` не виден — рестартит `/etc/init.d/podkop`
+- Защищает от OOM-падений (sing-box занимает ~40MB)
 
----
+**`/etc/route-watchdog.sh` — защита FakeIP-маршрутов:**
+- Проверяет маршрут `198.18.0.0/15` (диапазон FakeIP-адресов sing-box)
+- Проверяет что `PodkopTable` (nftables) жива
+- Если что-то пропало — восстанавливает / рестартит podkop
 
-#### 4.3 `/etc/route-watchdog.sh` — защита FakeIP-маршрутов
-```bash
-#!/bin/sh
-if ! ip route | grep -q "198.18.0.0/15"; then
-    logger -t route-watchdog "Restoring FakeIP routes"
-    ip route add 198.18.0.0/15 dev br-lan 2>/dev/null || true
-fi
-```
-
-**Что проверяет:**
-- Наличие маршрута `198.18.0.0/15` в таблице маршрутизации
-
-**Зачем нужен этот маршрут:**
-- sing-box с `dns_type=fakeip` выдаёт клиентам IP из диапазона 198.18.0.0/15
-- Это "фейковые" IP, которые sing-box затем перехватывает и проксирует
-- Без маршрута пакеты к 198.18.x.x уходят через WAN и теряются
-
-**Когда маршрут пропадает:**
-- При рестарте сети (`/etc/init.d/network restart`)
-- При изменении настроек LAN через LuCI
-- При перезагрузке firewall
-
-**Что на что влияет:**
 | Маршрут 198.18.0.0/15 | Результат |
 |-----------------------|-----------|
 | Есть | ✅ FakeIP работает, сайты открываются |
@@ -182,180 +113,130 @@ fi
 
 ---
 
-#### Cron-записи (каждые 2 минуты)
-```bash
+### Шаг 6: Crontab
+
+```
 */2 * * * * /etc/ts-watchdog.sh
 */2 * * * * /etc/podkop-watchdog.sh
 */2 * * * * /etc/route-watchdog.sh
+13 */3 * * * /usr/bin/podkop list_update
 ```
 
-**Почему именно */2 (2 минуты):**
-- `*/5` (5 минут) — слишком долго, роутер может остаться без связи на 5 минут
-- `*/1` (1 минута) — слишком часто, лишняя нагрузка на CPU
-- `*/2` — оптимальный баланс между скоростью восстановления и нагрузкой
+Три watchdog'а каждые 2 минуты + обновление community lists раз в 3 часа.
 
 ---
 
-### Шаг 5: Firewall — tailscale0 в LAN зоне
+**── После шага 6 Tailscale полностью защищён ──**
+
+---
+
+### Шаг 7: WAN ifname
+
 ```bash
-uci set firewall.@zone[0].device='br-lan tailscale0'
+uci set network.wan.ifname="$WAN_DEVICE"
 ```
 
-**Что делает:** Добавляет интерфейс `tailscale0` в LAN-зону firewall.
-
-**Зачем нужно:**
-- Без этого устройства в Tailscale-сети не могут достучаться до роутера
-- SSH через Tailscale не работает
-- LuCI через Tailscale-IP недоступен
-
-**Что на что влияет:**
-| tailscale0 в LAN | Результат |
-|------------------|-----------|
-| Есть | ✅ SSH и LuCI доступны через Tailscale-IP |
-| Нет | ❌ Только локальный доступ, Tailscale = только исходящий |
+Podkop использует `ifname`, а не `device`. На новых прошивках OpenWrt 25.12 WAN описывается через `device`. Копирует значение если `ifname` отсутствует.
 
 ---
 
-### Шаг 6: Перезапуск Tailscale
+### Шаг 8: Podkop настройки
+
 ```bash
-/etc/init.d/tailscale disable  # Отключаем стандартный init.d
-kill $(pgrep tailscaled)         # Убиваем старый процесс
-sleep 3
-/usr/sbin/tailscaled --state=/etc/tailscale/tailscaled.state \
-    --socket=/var/run/tailscale/tailscaled.sock &
-sleep 5
-tailscale up --accept-dns=false --accept-routes
+uci set podkop.settings.exclude_ntp='1'
+uci set podkop.settings.enable_output_network_interface='1'
+uci set podkop.main.mixed_proxy_enabled='0'
+uci set podkop.YT.mixed_proxy_enabled='0'
 ```
 
-**Почему `disable` стандартного init.d:**
-- Стандартный init.d запускает tailscaled в режиме, несовместимом с podkop
-- Может перезаписать fw_mode и firewall-правила
-- Наш rc.local даёт полный контроль над параметрами
-
-**Параметры запуска:**
-- `--state=/etc/tailscale/tailscaled.state` — файл состояния (ключи, настройки)
-- `--socket=/var/run/tailscale/tailscaled.sock` — сокет для tailscale CLI
-
-**Важно:** Без `--socket` команда `tailscale status` может не работать.
+- `exclude_ntp=1` — NTP идёт напрямую, минуя туннель. Иначе sing-box с FakeIP может дать роутеру "завтрашнее" время → TLS-сертификаты невалидны → HTTPS ломается везде
+- `enable_output_network_interface=1` — сам роутер ходит через туннель (не только LAN-клиенты)
+- `mixed_proxy_enabled=0` — отключает смешанный прокси, конфликтующий с sing-box
 
 ---
 
-## ✅ Финальная проверка
+### Шаг 9: `check-ip` — диагностический инструмент
 
-Скрипт выводит статус всех компонентов:
+Создаёт `/usr/bin/check-ip`. После применения скрипта запустить:
+```bash
+check-ip
+```
+Покажет внешний IP напрямую и через прокси, статус 10 сайтов (YouTube, Telegram, Instagram и др.).
+
+---
+
+### Шаг 10: `podkop-fw4-fix` (только OpenWrt 25.12+)
+
+Для роутеров на nftables (fw4) устанавливает патч совместимости Podkop с `mangle_forward` chain. На fw3/iptables пропускается автоматически.
+
+---
+
+### Шаг 11: `podkop-fix-lists`
+
+Исправляет community lists если они не скачались или устарели после применения основного скрипта.
+
+---
+
+### Шаг 12: Проверка firewall
+
+Диагностика (не лечит):
+- fw4: проверяет жива ли `inet PodkopTable` и есть ли `fw4-fix` правила
+- fw3: проверяет наличие Podkop-правил в iptables mangle
+
+---
+
+### Шаг 13: Финальная диагностика
 
 ```
-╔══════════════════════════════════════╗
-║         РЕЗУЛЬТАТ УСТАНОВКИ          ║
-╚══════════════════════════════════════╝
-
-  ✅ fw_mode = none
-  ✅ rc.local — автозапуск tailscaled
-  ✅ ts-watchdog — в crontab (каждые 2 мин)
-  ✅ podkop-watchdog — в crontab (каждые 2 мин)
-  ✅ route-watchdog — в crontab (каждые 2 мин)
-  ✅ firewall — tailscale0 в LAN зоне
-  ✅ exclude_ntp = 1
-  ✅ Tailscale online: 100.x.x.x hostname user@ linux online
-
-╔══════════════════════════════════════╗
-║  🎉 Всё готово! SSH через Tailscale  ║
-║     ssh root@<tailscale-ip>          ║
-╚══════════════════════════════════════╝
+ping 1.1.1.1        — есть ли интернет
+ping google.com     — работает ли DNS
+nslookup google.com — резолвится ли домен
 ```
 
 ---
 
-## 🔍 Типичные проблемы и решения
+## ✅ Финальный вывод скрипта
 
-### Проблема: "❌ fw_mode не none"
-**Решение:** Скрипт уже исправил, но Tailscale из init.d перезаписал. Проверить:
-```bash
-uci get tailscale.settings.fw_mode
-/etc/init.d/tailscale disable
 ```
+╔══════════════════════════════════════════════════╗
+║  ✅ СПАСЕНИЕ ПРИМЕНЕНО                           ║
+╚══════════════════════════════════════════════════╝
 
-### Проблема: "❌ rc.local — tailscaled НЕ найден"
-**Решение:** Возможно, /etc/rc.local был пустым. Проверить:
-```bash
-cat /etc/rc.local
-# Если пустой — скрипт автоматически создаст из .bak
+  fw_mode:           none
+  exclude_ntp:       1
+  init.d/tailscale:  DISABLED
+  watchdog'ов:       3 записи
+  tailscaled:        running
+  check-ip:          /usr/bin/check-ip
 ```
-
-### Проблема: "❌ watchdog отсутствует"
-**Решение:** Cron мог не примениться. Проверить:
-```bash
-crontab -l | grep watchdog
-```
-
-### Проблема: Tailscale не поднимается
-**Возможные причины:**
-1. **Нет интернета на WAN** — Tailscale не может авторизоваться
-2. **Сертификаты слетели** — проверить `date`, должно быть актуальное время
-3. **State-файл повреждён** — удалить `/etc/tailscale/tailscaled.state` и перезапустить
 
 ---
 
-## 📊 Архитектура после применения
+## 🔍 Типичные проблемы
 
+### Tailscale не поднимается после ребута
+```bash
+cat /etc/rc.local          # должен содержать tailscaled
+ls /etc/tailscale/         # должен быть state-файл
+logread | grep tailscale   # смотреть ошибки
 ```
-┌─────────────────────────────────────────┐
-│           OpenWrt Router              │
-├─────────────────────────────────────────┤
-│  ┌──────────┐      ┌──────────────┐   │
-│  │ Tailscale│◄────►│  tailscale0  │   │
-│  │ userspace│      │  (в LAN zone)│   │
-│  └──────────┘      └──────────────┘   │
-│       │                                 │
-│       ▼                                 │
-│  100.x.x.x (Tailscale IP)               │
-│       │                                 │
-│  SSH ◄┘                                 │
-│                                         │
-│  ┌─────────────────────────────────┐    │
-│  │        Podkop / sing-box        │    │
-│  │  ┌────────┐    ┌─────────────┐   │    │
-│  │  │ FakeIP │───►│  sing-box   │   │    │
-│  │  │  DNS   │    │   (gRPC)    │   │    │
-│  │  └────────┘    └─────────────┘   │    │
-│  │                    │            │    │
-│  │             ┌──────┴──────┐       │    │
-│  │             ▼             ▼       │    │
-│  │        ┌────────┐    ┌────────┐   │    │
-│  │        │  YT    │    │  Main  │   │    │
-│  │        │ bMSK   │    │ relay  │   │    │
-│  │        └────────┘    └────────┘   │    │
-│  └─────────────────────────────────┘    │
-│                                         │
-│  ┌─────────────────────────────────┐    │
-│  │  Watchdogs (*/2 минуты)         │    │
-│  │  • ts-watchdog.sh              │    │
-│  │  • podkop-watchdog.sh          │    │
-│  │  • route-watchdog.sh           │    │
-│  └─────────────────────────────────┘    │
-└─────────────────────────────────────────┘
+
+### FakeIP не работает (DNS ОК, сайты не грузятся)
+```bash
+ip route | grep 198.18    # должен быть маршрут
+nft list table inet PodkopTable  # должна существовать
+```
+
+### SSH через Tailscale недоступен
+```bash
+uci get firewall.@zone[0].device  # должно содержать tailscale0
 ```
 
 ---
 
 ## 📝 История изменений
 
-| Версия | Дата | Изменения |
-|--------|------|-----------|
-| 1.0 | 2026-05-06 | Первый релиз с 3 watchdog'ами, правильный формат tailscaled, восстановление rc.local |
-
----
-
-## ⚠️ Важные замечания
-
-1. **Скрипт не создаёт ключи VLESS** — только настраивает инфраструктуру. Ключи устанавливаются отдельно через `uci set podkop.main.proxy_string=...`
-
-2. **Скрипт не проверяет доступность интернета** — если WAN не работает, Tailscale не поднимется
-
-3. **После применения проверить:**
-   ```bash
-   ssh root@<tailscale-ip>
-   curl -s https://telegram.org | head -1  # должно вернуть HTML
-   ```
-
-4. **Если роутер далеко** — этот скрипт спасёт ситуацию, но убедитесь, что Tailscale был настроен ДО потери доступа
+| Дата | Изменения |
+|------|-----------|
+| 2026-05-10 | Новый порядок: Tailscale (шаги 1–6) строго до Podkop (шаги 7–8). Причина: set -e — ошибка в Podkop не должна блокировать запись rc.local |
+| 2026-05-06 | Первый релиз: 3 watchdog'а, userspace-networking, восстановление rc.local |

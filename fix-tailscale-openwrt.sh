@@ -75,7 +75,26 @@ if ! ps | grep -q "tailscaled --state="; then
 fi
 
 # 2. Проверка что tailscale онлайн
-if tailscale status 2>&1 | grep -q '100\.'; then
+TS_STATUS=$(tailscale status 2>&1)
+
+# 2a. Если tailscaled в битом состоянии (NoState) — перезапускаем целиком
+if echo "$TS_STATUS" | grep -q "NoState"; then
+    logger -t ts-watchdog "tailscaled in NoState (DERP lost), full restart..."
+    killall tailscale 2>/dev/null
+    sleep 1
+    killall tailscaled 2>/dev/null
+    sleep 2
+    tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
+    sleep 5
+    date +%s > /tmp/ts-up-start
+    tailscale up --accept-dns=false --accept-routes &
+    logger -t ts-watchdog "tailscaled fully restarted (NoState fix)"
+    rm -f "$LOCKFILE"
+    exit 0
+fi
+
+# 2b. Нормальный онлайн
+if echo "$TS_STATUS" | grep -q '100\.'; then
     # ✅ Tailscale онлайн — ничего не делаем
     # Применяем podkop-fw4-fix если нужно
     if [ -x /root/podkop-fw4-fix.sh ]; then
@@ -91,8 +110,9 @@ logger -t ts-watchdog "tailscale not online, reconnecting..."
 # Проверяем не висит ли tailscale up
 TS_UP_PID=$(ps | grep "tailscale up" | grep -v grep | awk '{print $1}')
 if [ -n "$TS_UP_PID" ]; then
-    # Если tailscale up висит больше 30 сек — убиваем
-    if [ -f /tmp/ts-up-start ] && [ $(($(date +%s) - $(cat /tmp/ts-up-start))) -gt 30 ]; then
+    # Если tailscale up висит больше 90 сек — убиваем
+    # 30 сек мало — tailscale up может висеть 40-50 сек при первом запуске
+    if [ -f /tmp/ts-up-start ] && [ $(($(date +%s) - $(cat /tmp/ts-up-start))) -gt 90 ]; then
         logger -t ts-watchdog "tailscale up stuck (PID $TS_UP_PID), killing..."
         kill "$TS_UP_PID" 2>/dev/null
         sleep 2

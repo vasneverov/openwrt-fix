@@ -43,14 +43,15 @@ exit 0
 RCEOF
 chmod +x /etc/rc.local; cp /etc/rc.local /etc/rc.local.bak
 
-echo "[4/6] ts-watchdog v3 — единый, с lock-файлом"
+echo "[4/6] ts-watchdog v3.1 — единый, с lock-файлом + NoState fix"
 cat > /etc/ts-watchdog.sh << 'WEOF'
 #!/bin/sh
 
-# === ts-watchdog v3 ===
+# === ts-watchdog v3.1 ===
 # Единый watchdog: работает и из rc.local, и из крона
 # Lock-файл: не запускается дважды
 # Не убивает tailscale если он уже онлайн
+# NoState fix: если tailscale status выдаёт NoState — killall tailscaled + запуск заново
 
 LOCKFILE=/tmp/ts-watchdog.lock
 

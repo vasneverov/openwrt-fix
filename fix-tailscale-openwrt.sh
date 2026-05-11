@@ -43,16 +43,25 @@ echo "  ✅ fw_mode = none"
 echo ""
 
 # ===== ШАГ 2: podkop настройки =====
-echo "━━━ [2/10] Podkop: exclude_ntp, mixed_proxy, enable_output ━━━"
+echo "━━━ [2/10] Podkop: exclude_ntp, mixed_proxy, enable_output, direct_domains ━━━"
 uci set podkop.settings.exclude_ntp='1' 2>/dev/null
 uci set podkop.main.exclude_ntp='1' 2>/dev/null
 uci set podkop.main.mixed_proxy_enabled='0' 2>/dev/null
 uci set podkop.YT.mixed_proxy_enabled='0' 2>/dev/null
 uci set podkop.settings.enable_output_network_interface='1' 2>/dev/null
+
+# direct_domains для стабильности Tailscale long-poll
+for DOMAIN in tailscale.com controlplane.tailscale.com login.tailscale.com; do
+    if ! uci show podkop.settings.direct_domains 2>/dev/null | grep -q "$DOMAIN"; then
+        uci add_list podkop.settings.direct_domains="$DOMAIN"
+    fi
+done
+
 uci commit podkop 2>/dev/null
 echo "  ✅ exclude_ntp = 1"
 echo "  ✅ mixed_proxy_enabled = 0"
 echo "  ✅ enable_output_network_interface = 1"
+echo "  ✅ direct_domains = tailscale.com + controlplane + login"
 echo ""
 
 # ===== ШАГ 3: rc.local =====

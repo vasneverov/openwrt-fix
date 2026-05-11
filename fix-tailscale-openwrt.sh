@@ -341,3 +341,51 @@ echo "║  SSH через Tailscale: ssh root@<tailscale-ip>      ║"
 echo "║  Watchdog проверит Tailscale каждые 2 мин           ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
+
+# ===== ТЕСТОВАЯ ПРОВЕРКА: direct_domains + Tailscale =====
+echo "━━━ ТЕСТ: direct_domains + Tailscale ━━━"
+echo ""
+
+# 1. Проверка direct_domains
+DD_COUNT=$(uci show podkop.settings.direct_domains 2>/dev/null | grep -c 'tailscale')
+if [ "$DD_COUNT" -ge 3 ]; then
+    echo "  ✅ direct_domains: $DD_COUNT доменов (tailscale.com + controlplane + login)"
+else
+    echo "  ⚠️ direct_domains: только $DD_COUNT из 3"
+fi
+
+# 2. Проверка DERP соединения
+if [ -f /tmp/ts.log ]; then
+    DERP=$(tail -20 /tmp/ts.log 2>/dev/null | grep 'derp.*connected' | tail -1)
+    if echo "$DERP" | grep -q 'derp-'; then
+        echo "  ✅ DERP: $(echo "$DERP" | grep -o 'derp-[0-9]* connected')"
+    else
+        echo "  ⏳ DERP: ещё не подключён (ждём...)"
+    fi
+fi
+
+# 3. Проверка статуса Tailscale
+TS_LINE=$(tailscale status 2>/dev/null | head -1)
+TS_IP=$(echo "$TS_LINE" | awk '{print $1}')
+TS_STATUS=$(echo "$TS_LINE" | awk '{print $4}')
+if echo "$TS_LINE" | grep -q '100\.'; then
+    if [ "$TS_STATUS" = "-" ] || [ "$TS_STATUS" = "online" ]; then
+        echo "  ✅ Tailscale: $TS_IP — ONLINE"
+    else
+        echo "  ⏳ Tailscale: $TS_IP — $TS_STATUS (ждём...)"
+    fi
+else
+    echo "  ⏳ Tailscale: поднимается..."
+fi
+
+# 4. Проверка long-poll в логе (не должно быть context canceled)
+CANCEL_COUNT=$(tail -50 /tmp/ts.log 2>/dev/null | grep -c 'context canceled')
+if [ "$CANCEL_COUNT" -eq 0 ]; then
+    echo "  ✅ Long-poll: стабилен (нет context canceled)"
+else
+    echo "  ⚠️ Long-poll: $CANCEL_COUNT обрывов (ждём watchdog)"
+fi
+
+echo ""
+echo "━━━ Если все ✅ — Tailscale стабилен. Если ⏳ — подожди 2 мин, watchdog доделает. ━━━"
+echo ""

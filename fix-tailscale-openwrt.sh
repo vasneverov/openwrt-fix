@@ -97,8 +97,57 @@ echo "  ✅ enable_output_network_interface = 1"
 echo "  ✅ direct_domains = tailscale.com + controlplane + login"
 echo ""
 
-# ===== ШАГ 4: rc.local =====
-echo "━━━ [4/11] rc.local — автозапуск tailscaled + watchdog ━━━"
+# ===== ШАГ 3.5: WAN ifname (podkop использует ifname, а не device) =====
+echo "━━━ [3.5/11] WAN ifname → проверка ━━━"
+WAN_IFNAME=$(uci get network.wan.ifname 2>/dev/null)
+if [ -z "$WAN_IFNAME" ]; then
+    WAN_DEVICE=$(uci get network.wan.device 2>/dev/null)
+    if [ -n "$WAN_DEVICE" ]; then
+        uci set network.wan.ifname="$WAN_DEVICE"
+        uci commit network
+        echo "  ✅ network.wan.ifname=$WAN_DEVICE (добавлен из device)"
+    else
+        echo "  ⚠️ WAN device не найден, пропускаем"
+    fi
+else
+    echo "  ✅ network.wan.ifname=$WAN_IFNAME (уже есть)"
+fi
+echo ""
+
+# ===== ШАГ 4: podkop-fw4-fix.sh — nftables fix для fw4 =====
+echo "━━━ [4/11] podkop-fw4-fix.sh — nftables fix для fw4 ━━━"
+cat > /root/podkop-fw4-fix.sh << 'FWEOF'
+#!/bin/sh
+# podkop-fw4-fix.sh — добавляет правила nftables для корректной работы podkop с fw4
+# Запускается после старта podkop, чтобы mangle_forward не блокировал трафик
+
+ACTION="${1:-update}"
+
+case "$ACTION" in
+  update|add)
+    for MARK in 0x00100000 0x00010000 0x00020000 0x00040000; do
+      if ! nft -a list chain inet fw4 mangle_forward 2>/dev/null | grep -q "meta mark $MARK accept"; then
+        nft add rule inet fw4 mangle_forward meta mark $MARK accept 2>/dev/null || true
+      fi
+    done
+    ;;
+  check)
+    COUNT=$(nft list chain inet fw4 mangle_forward 2>/dev/null | grep -c 'meta mark 0x00' || echo 0)
+    echo "$COUNT"
+    ;;
+  *)
+    echo "Usage: $0 {update|add|check}"
+    exit 1
+    ;;
+esac
+FWEOF
+chmod +x /root/podkop-fw4-fix.sh
+/root/podkop-fw4-fix.sh update
+echo "  ✅ /root/podkop-fw4-fix.sh — создан и применён"
+echo ""
+
+# ===== ШАГ 4b: rc.local — новый формат (timeout + fw4-fix + watchdog) =====
+echo "━━━ [4b/11] rc.local — timeout + fw4-fix + watchdog ━━━"
 cat > /etc/rc.local << 'RCEOF'
 #!/bin/sh
 
@@ -106,6 +155,21 @@ cat > /etc/rc.local << 'RCEOF'
 tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
 sleep 3
 tailscale up --accept-dns=false --accept-routes &
+
+# === ОЖИДАНИЕ TAILSCALE (до 120 сек) ===
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if tailscale status 2>&1 | grep -q '100\.'; then
+        logger -t rc.local "tailscale online after ${i}0s"
+        break
+    fi
+    sleep 10
+done
+
+# === fw4-fix ===
+if [ -x /root/podkop-fw4-fix.sh ]; then
+    /root/podkop-fw4-fix.sh update
+    logger -t rc.local "podkop-fw4-fix applied"
+fi
 
 # === WATCHDOG В ФОНЕ ===
 /etc/ts-watchdog.sh &
@@ -115,8 +179,9 @@ exit 0
 RCEOF
 chmod +x /etc/rc.local
 cp /etc/rc.local /etc/rc.local.bak 2>/dev/null
-echo "  ✅ rc.local — tailscaled + watchdog"
+echo "  ✅ rc.local — timeout 120s + fw4-fix + watchdog"
 echo ""
+
 
 # ===== ШАГ 5: ts-watchdog v3.1 =====
 echo "━━━ [5/11] ts-watchdog v3.1 — единый, lock, NoState fix ━━━"

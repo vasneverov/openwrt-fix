@@ -132,3 +132,38 @@ itdoginfo ставит **полный** sing-box (40 MB), который **не 
 
 [@vasneverov](https://github.com/vasneverov)  
 Основано на [podkop](https://github.com/itdoginfo/podkop) от itdoginfo.
+
+---
+
+## fix-tailscale-openwrt.sh v3.3 — спасительный скрипт
+
+Автоматическая настройка Tailscale + watchdogs на OpenWrt.
+
+### Что нового в v3.3 (16.05.2026)
+
+| Изменение | Было (v3.2) | Стало (v3.3) | Зачем |
+|-----------|-------------|--------------|-------|
+| **rc.local** | `tailscale up ... &` (в фоне, без authkey) | `tailscale up --reset --authkey=$TS_AUTH_KEY --hostname=... --netfilter-mode=off` (синхронно) | После ребута `--reset` без ключа сбрасывал авторизацию → Logged out |
+| **Authkey** | Не сохранялся, rc.local перезаписывался без ключа | Извлекается из старого rc.local **до** перезаписи | Ключ не теряется после применения скрипта |
+| **Очистка сокета** | Отсутствовала | `rm -f /var/run/tailscale/tailscaled.sock` | Старый сокет → NoState loop |
+| **nftables** | Отсутствовали | `nft add rule inet fw4 forward ip daddr 100.64.0.0/10 counter accept` | Tailscale через двойной NAT не мог установить long-poll |
+| **Watchdog v3.2** | Проверял только наличие `100.x.x.x` в статусе | Проверяет **и** отсутствие `offline` | При offline tailscale всё равно показывает IP → watchdog не чинил |
+| **Grace period** | Отсутствовал | 180 секунд после загрузки | Не убивает tailscaled пока он стартует |
+
+### Схема работы watchdog v3.2
+
+```
+tailscale status → 100.x.x.x  z56-70  ...  offline
+                          ↑ IP есть           ↑ watchdog видит "offline"
+                          └── раньше watchdog выходил (думал ONLINE)
+                          └── теперь watchdog: "offline! → перезапуск"
+```
+
+### Установка
+
+```bash
+sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
+```
+
+**Важно:** После скрипта нужно восстановить rc.local с authkey (если скрипт не нашёл ключ в старом rc.local).  
+Подробнее: шаг 7 в `flash_router_universal.md`.

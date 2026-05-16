@@ -1,242 +1,134 @@
-# 🔧 OpenWrt Rescue Script — Полное восстановление Tailscale + Podkop
+# thin-podkop 🎯
 
-**One-liner для запуска:**
+**Podkop + sing-box-tiny** — быстрая установка на OpenWrt 24.x и 25.x.
+
+[![OpenWrt](https://img.shields.io/badge/OpenWrt-24.10_|_25.12-00ff00)](https://openwrt.org)
+[![License](https://img.shields.io/badge/license-GPL--2.0-blue)](LICENSE)
+
+## Что это
+
+Установщик Podkop (прокси-туннелирование) с **тонким sing-box** вместо полного.  
+Создан для роутеров с ограниченной flash-памятью (Cudy WR3000S/H, TR3000, M300 и аналоги).
+
+| | Полный (itdoginfo) | Тонкий (thin-podkop) |
+|---|---|---|
+| sing-box | полный ~40 MB | **tiny ~10 MB** |
+| Flash нужно | ≥ 42 MB свободно | ≥ 18 MB свободно |
+| Время установки | ~20 сек | ~18 сек |
+| Что ставится | podkop + luci + русский | podkop + luci + русский |
+| Работает на Cudy с 44 MB | ❌ не влезает | ✅ влезает |
+
+## Установка
+
+**Скопируй и выполни** в консоли роутера (SSH):
+
 ```bash
+sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/thin-podkop-installer.sh)
+```
+
+или через curl:
+
+```bash
+sh <(curl -sL https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/thin-podkop-installer.sh)
+```
+
+**Никаких флагов, выборов, подтверждений.**  
+Скрипт сам определяет:
+- Какой менеджер пакетов: `opkg` (24.x) или `apk` (25.x)
+- Какой sing-box нужен — тянет тонкий
+- Русский язык — ставится без вопросов
+
+## После установки
+
+```bash
+# 1. Вставить ключ
+uci set podkop.main.proxy_string='vless://YOUR_UUID@YOUR_SERVER:5090?...'
+uci commit podkop
+
+# 2. 21 список (youtube в списке, YT секцию удалить)
+uci del podkop.main.community_lists
+for l in telegram meta youtube geoblock block porn news anime discord twitter hdrezka tiktok cloudflare google_ai google_play hodca roblox hetzner ovh digitalocean cloudfront; do
+    uci add_list podkop.main.community_lists="$l"
+done
+uci commit podkop
+
+# 3. Спасительный скрипт
 sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
+
+# 4. Обновить списки и запустить
+/usr/bin/podkop list_update
+/etc/init.d/podkop restart
 ```
 
----
+## Поддерживаемые роутеры
 
-## 📋 Что делает этот скрипт
+| Модель | Flash | OpenWrt | Архитектура | Результат |
+|--------|-------|---------|-------------|-----------|
+| Cudy WR3000S v1 | 44.7 MB | 24.10.5 | aarch64_cortex-a53 | ✅ |
+| Cudy WR3000H v1 | 44.7 MB | 24.10.x | aarch64_cortex-a53 | ✅ |
+| Cudy TR3000 v1 | 44.7 MB | 25.12.0 | aarch64_cortex-a53 | ✅ |
+| Cudy M300 | 44.7 MB | 24.10.x | aarch64_cortex-a53 | ✅ |
+| Xiaomi AX3000T | 59.8 MB | 24.10.1 | aarch64_cortex-a53 | ✅ (и полный влезает) |
 
-Универсальное восстановление роутера OpenWrt после сбоев, обновлений или при первичной настройке. Настраивает **Tailscale для удалённого доступа** и **Podkop (sing-box) для обхода блокировок**.
+## Как это работает
 
-**Железные правила скрипта:**
-- ❌ Tailscale НЕ перезагружаем (оборвётся SSH)
-- ❌ Podkop НЕ рестартим (может сломать маршрутизацию)
-- ❌ firewall НЕ reload (сбросит правила Tailscale)
-- ❌ reboot НЕ делаем
+Скрипт основан на [itdoginfo/podkop/install.sh](https://github.com/itdoginfo/podkop) с одним ключевым отличием.
+itdoginfo ставит **полный** sing-box (40 MB), который **не влезает** на Cudy-роутеры с 44 MB флеш-памяти.  
 
----
+`thin-podkop` **перед** установкой podkop ставит **sing-box-tiny** (10 MB),  
+который предоставляет (имеет `Provides: sing-box`) тот же функционал,  
+поэтому opkg/apk не тянет полный sing-box как зависимость.
 
-## 🎯 Порядок выполнения
-
-### Принцип: сначала Tailscale, потом всё остальное
-
-Первые 6 шагов полностью защищают Tailscale. Только после этого трогается Podkop.
-Причина: `set -e` — при любой ошибке скрипт остановится. Если Podkop-команды упадут раньше, чем записан rc.local, роутер потеряет Tailscale после ребута навсегда.
-
----
-
-### Шаг 1: `fw_mode → none`
-
-```bash
-uci set tailscale.settings.fw_mode='none'
-```
-
-Tailscale в режиме `nftables` перезаписывает таблицы firewall и уничтожает `PodkopTable`. Режим `none` запрещает Tailscale трогать firewall.
-
-| fw_mode | Результат |
-|---------|-----------|
-| `nftables` | ❌ PodkopTable затирается, VPN не работает |
-| `none` | ✅ PodkopTable сохраняется, VPN работает |
-
----
-
-### Шаг 2: `init.d/tailscale → DISABLED`
-
-```bash
-/etc/init.d/tailscale disable
-```
-
-Системный init.d запускает Tailscale в kernel-mode, который при каждом старте сбрасывает `PodkopTable`. Отключаем навсегда — запуском управляет rc.local из шага 3.
-
----
-
-### Шаг 3: `rc.local` — автозапуск Tailscale через ребут
-
-```bash
-cat > /etc/rc.local << 'EOF'
-#!/bin/sh
-(sleep 40
-tailscaled --tun=userspace-networking --statedir=/etc/tailscale/ >> /tmp/ts.log 2>&1 &
-sleep 5
-tailscale up --accept-dns=false --accept-routes
-sleep 10
-logger -t rc.local 'tailscale up applied') &
-exit 0
-EOF
-```
-
-Записывает правильный запуск в `/etc/rc.local` и сохраняет бэкап в `/etc/rc.local.bak`.
-
-**Ключевые параметры:**
-- `--tun=userspace-networking` — работает без TUN-модуля ядра, совместим со всеми роутерами
-- `--statedir=/etc/tailscale/` — персистентная папка (не `/var/lib`, которая в RAM и стирается при ребуте)
-- `sleep 40` — ждёт пока система поднимет сеть и DNS
-- `--accept-dns=false` — не меняет DNS роутера
-
----
-
-### Шаг 4: `tailscale0 → LAN зона` (без reload!)
-
-```bash
-uci set firewall.@zone[0].device='br-lan tailscale0'
-uci commit firewall
-```
-
-Без этого SSH и LuCI недоступны через Tailscale-IP. Добавляет `tailscale0` в LAN-зону только через UCI — без `fw reload`, который сбросил бы правила Podkop.
-
----
-
-### Шаг 5: Три watchdog-скрипта
-
-Все три запускаются cron каждые 2 минуты.
-
-**`/etc/ts-watchdog.sh` — защита Tailscale:**
-1. Если `/etc/rc.local` повреждён — восстанавливает из `/etc/rc.local.bak`
-2. Если процесс `tailscaled` упал — перезапускает
-
-**`/etc/podkop-watchdog.sh` — защита sing-box:**
-- Если процесс `sing-box run` не виден — рестартит `/etc/init.d/podkop`
-- Защищает от OOM-падений (sing-box занимает ~40MB)
-
-**`/etc/route-watchdog.sh` — защита FakeIP-маршрутов:**
-- Проверяет маршрут `198.18.0.0/15` (диапазон FakeIP-адресов sing-box)
-- Проверяет что `PodkopTable` (nftables) жива
-- Если что-то пропало — восстанавливает / рестартит podkop
-
-| Маршрут 198.18.0.0/15 | Результат |
-|-----------------------|-----------|
-| Есть | ✅ FakeIP работает, сайты открываются |
-| Нет | ❌ DNS резолвится, но сайты не грузятся |
-
----
-
-### Шаг 6: Crontab
+## Как выглядит установка
 
 ```
-*/2 * * * * /etc/ts-watchdog.sh
-*/2 * * * * /etc/podkop-watchdog.sh
-*/2 * * * * /etc/route-watchdog.sh
-13 */3 * * * /usr/bin/podkop list_update
+╔══════════════════════════════════════════════════════════╗
+║     🎯  thin-podkop v1.0  —  тонкая установка          ║
+║     📡  100.99.179.1  │  Cudy TR3000                   ║
+║     🔧  opkg  │  aarch64_cortex-a53                    ║
+║     📦  Podkop 0.7.17  │  sing-box-tiny 1.12.22        ║
+╚══════════════════════════════════════════════════════════╝
+
+ ─── [1/6]  System Check ─────────────────────────────
+   ✓ Device: Cudy TR3000 v1
+   ✓ OS:     OpenWrt 25.12.0  │  AArch64
+   ✓ Flash:  18.9 MB free
+
+ ─── [2/6]  Cleaning Old Podkop ───────────────────────
+   ✓ Removed old podkop
+
+ ─── [3/6]  Installing sing-box-tiny ──────────────────
+   ✓ sing-box-tiny 1.12.22  │  7.2 MB installed
+
+ ─── [4/6]  Downloading Podkop from GitHub ────────────
+   ✓ podkop-v0.7.17-r1-all.ipk
+   ✓ luci-app-podkop-v0.7.17-r1-all.ipk
+   ✓ luci-i18n-podkop-ru-0.7.17.ipk
+
+ ─── [5/6]  Installing Podkop + LuCI ──────────────────
+   ✓ Podkop v0.7.17
+   ✓ LuCI: Services → Podkop
+   ✓ Russian language
+   ✓ Default config (DNS 1.1.1.1, exclude_ntp=1)
+
+ ─── [6/6]  Verify ────────────────────────────────────
+   ✓ podkop: v0.7.17  │  sing-box: 1.12.22
+   ✓ Free space: 18.9 MB
+   ✓ Proxy: loc=DE
+
+╔══════════════════════════════════════════════════════════╗
+║     🎉  Установка завершена!                            ║
+╚══════════════════════════════════════════════════════════╝
 ```
 
-Три watchdog'а каждые 2 минуты + обновление community lists раз в 3 часа.
+## Известные ограничения
 
----
+- **OpenWrt 25.x:** sing-box-tiny может отсутствовать в репозиториях.  
+  В этом случае скрипт загружает бинарник напрямую.
+- Для **24.x** стабильно: `opkg install sing-box-tiny` из официального репозитория.
+- После установки требуется ручная настройка ключа и списков (см. выше).
 
-**── После шага 6 Tailscale полностью защищён ──**
+## Автор
 
----
-
-### Шаг 7: WAN ifname
-
-```bash
-uci set network.wan.ifname="$WAN_DEVICE"
-```
-
-Podkop использует `ifname`, а не `device`. На новых прошивках OpenWrt 25.12 WAN описывается через `device`. Копирует значение если `ifname` отсутствует.
-
----
-
-### Шаг 8: Podkop настройки
-
-```bash
-uci set podkop.settings.exclude_ntp='1'
-uci set podkop.settings.enable_output_network_interface='1'
-uci set podkop.main.mixed_proxy_enabled='0'
-uci set podkop.YT.mixed_proxy_enabled='0'
-```
-
-- `exclude_ntp=1` — NTP идёт напрямую, минуя туннель. Иначе sing-box с FakeIP может дать роутеру "завтрашнее" время → TLS-сертификаты невалидны → HTTPS ломается везде
-- `enable_output_network_interface=1` — сам роутер ходит через туннель (не только LAN-клиенты)
-- `mixed_proxy_enabled=0` — отключает смешанный прокси, конфликтующий с sing-box
-
----
-
-### Шаг 9: `check-ip` — диагностический инструмент
-
-Создаёт `/usr/bin/check-ip`. После применения скрипта запустить:
-```bash
-check-ip
-```
-Покажет внешний IP напрямую и через прокси, статус 10 сайтов (YouTube, Telegram, Instagram и др.).
-
----
-
-### Шаг 10: `podkop-fw4-fix` (только OpenWrt 25.12+)
-
-Для роутеров на nftables (fw4) устанавливает патч совместимости Podkop с `mangle_forward` chain. На fw3/iptables пропускается автоматически.
-
----
-
-### Шаг 11: `podkop-fix-lists`
-
-Исправляет community lists если они не скачались или устарели после применения основного скрипта.
-
----
-
-### Шаг 12: Проверка firewall
-
-Диагностика (не лечит):
-- fw4: проверяет жива ли `inet PodkopTable` и есть ли `fw4-fix` правила
-- fw3: проверяет наличие Podkop-правил в iptables mangle
-
----
-
-### Шаг 13: Финальная диагностика
-
-```
-ping 1.1.1.1        — есть ли интернет
-ping google.com     — работает ли DNS
-nslookup google.com — резолвится ли домен
-```
-
----
-
-## ✅ Финальный вывод скрипта
-
-```
-╔══════════════════════════════════════════════════╗
-║  ✅ СПАСЕНИЕ ПРИМЕНЕНО                           ║
-╚══════════════════════════════════════════════════╝
-
-  fw_mode:           none
-  exclude_ntp:       1
-  init.d/tailscale:  DISABLED
-  watchdog'ов:       3 записи
-  tailscaled:        running
-  check-ip:          /usr/bin/check-ip
-```
-
----
-
-## 🔍 Типичные проблемы
-
-### Tailscale не поднимается после ребута
-```bash
-cat /etc/rc.local          # должен содержать tailscaled
-ls /etc/tailscale/         # должен быть state-файл
-logread | grep tailscale   # смотреть ошибки
-```
-
-### FakeIP не работает (DNS ОК, сайты не грузятся)
-```bash
-ip route | grep 198.18    # должен быть маршрут
-nft list table inet PodkopTable  # должна существовать
-```
-
-### SSH через Tailscale недоступен
-```bash
-uci get firewall.@zone[0].device  # должно содержать tailscale0
-```
-
----
-
-## 📝 История изменений
-
-| Дата | Изменения |
-|------|-----------|
-| 2026-05-10 | Новый порядок: Tailscale (шаги 1–6) строго до Podkop (шаги 7–8). Причина: set -e — ошибка в Podkop не должна блокировать запись rc.local |
-| 2026-05-06 | Первый релиз: 3 watchdog'а, userspace-networking, восстановление rc.local |
+[@vasneverov](https://github.com/vasneverov)  
+Основано на [podkop](https://github.com/itdoginfo/podkop) от itdoginfo.

@@ -146,24 +146,29 @@ chmod +x /root/podkop-fw4-fix.sh
 echo "  ✅ /root/podkop-fw4-fix.sh — создан и применён"
 echo ""
 
-# ===== ШАГ 4b: rc.local — новый формат (timeout + fw4-fix + watchdog) =====
+# Извлекаем authkey и hostname из старого rc.local ДО перезаписи
+TS_AUTH_KEY=$(grep 'authkey=' /etc/rc.local 2>/dev/null | grep -o 'authkey=[^ ]*' | cut -d= -f2)
+ROUTER_HOSTNAME=$(uci get system.@system[0].hostname 2>/dev/null || echo "router")
+# Если authkey не найден — используем текущие параметры
+[ -z "$TS_AUTH_KEY" ] && TS_AUTH_KEY=""
+
+# ===== ШАГ 4b: rc.local — с authkey + nftables + watchdog =====
 echo "━━━ [4b/11] rc.local — timeout + fw4-fix + watchdog ━━━"
-cat > /etc/rc.local << 'RCEOF'
+cat > /etc/rc.local << RCEOF
 #!/bin/sh
 
-# === TAILSCALE STARTUP ===
+# === NFTABLES: Tailscale прямые маршруты ===
+nft add rule inet fw4 forward ip daddr 100.64.0.0/10 counter accept 2>/dev/null
+nft add rule inet fw4 forward ip daddr 192.200.0.0/24 counter accept 2>/dev/null
+nft add rule inet fw4 forward ip saddr 100.64.0.0/10 counter accept 2>/dev/null
+
+# === ОЧИСТКА СТАРОГО СОКЕТА ===
+rm -f /var/run/tailscale/tailscaled.sock
+
+# === TAILSCALE STARTUP (синхронно — без &) ===
 tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
 sleep 3
-tailscale up --accept-dns=false --accept-routes &
-
-# === ОЖИДАНИЕ TAILSCALE (до 120 сек) ===
-for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    if tailscale status 2>&1 | grep -q '100\.'; then
-        logger -t rc.local "tailscale online after ${i}0s"
-        break
-    fi
-    sleep 10
-done
+tailscale up --reset --authkey=$TS_AUTH_KEY --hostname=$ROUTER_HOSTNAME --accept-routes --accept-dns=false --netfilter-mode=off
 
 # === fw4-fix ===
 if [ -x /root/podkop-fw4-fix.sh ]; then

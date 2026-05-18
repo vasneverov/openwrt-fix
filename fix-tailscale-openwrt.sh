@@ -222,6 +222,7 @@ echo $$ > "$LOCKFILE"
 
 if ! ps | grep -q "tailscaled --state="; then
     logger -t ts-watchdog "tailscaled not running, restarting..."
+    rm -f /var/run/tailscale/tailscaled.sock
     tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
     sleep 5
     tailscale up --accept-dns=false --accept-routes &
@@ -238,6 +239,7 @@ if echo "$TS_STATUS" | grep -q "NoState"; then
     sleep 1
     killall tailscaled 2>/dev/null
     sleep 2
+    rm -f /var/run/tailscale/tailscaled.sock
     tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
     sleep 5
     date +%s > /tmp/ts-up-start

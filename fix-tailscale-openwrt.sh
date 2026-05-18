@@ -449,5 +449,36 @@ CANCEL_COUNT=$(tail -50 /tmp/ts.log 2>/dev/null | grep -c 'context canceled')
 [ "$CANCEL_COUNT" -eq 0 ] && echo "  ✅ Long-poll: стабилен" || echo "  ⚠️ Long-poll: $CANCEL_COUNT обрывов"
 
 echo ""
-echo "━━━ Если все ✅ — Tailscale стабилен. Если ⏳ — подожди 2 мин, watchdog доделает. ━━━"
+
+# ===== v3.3 DIAGNOSTICS: reboot-proof checks =====
+echo "━━━ ДИАГНОСТИКА: reboot-proof ━━━"
+echo ""
+
+# Check 1: no user_domain_list_type
+if uci get podkop.main.user_domain_list_type 2>/dev/null; then
+    echo "  ❌ user_domain_list_type = $(uci get podkop.main.user_domain_list_type) — УДАЛИТЬ!"
+else
+    echo "  ✅ user_domain_list_type: отсутствует"
+fi
+
+# Check 2: socket cleanup in rc.local
+grep -q 'rm -f /var/run/tailscale/tailscaled.sock' /etc/rc.local && echo "  ✅ socket cleanup в rc.local" || echo "  ❌ socket cleanup отсутствует в rc.local"
+
+# Check 3: no --reset in rc.local (if state exists)
+if [ -f /etc/tailscale/tailscaled.state ]; then
+    grep -q -- '--reset' /etc/rc.local && echo "  ❌ --reset найден в rc.local при state-файле!" || echo "  ✅ rc.local: без --reset (state-файл есть)"
+fi
+
+# Check 4: tailscale up with & in rc.local
+grep -q 'tailscale up.*&' /etc/rc.local && echo "  ✅ tailscale up с & (не блокирует)" || echo "  ❌ tailscale up без &"
+
+# Check 5: watchdog socket cleanup
+grep -q 'rm -f /var/run/tailscale/tailscaled.sock' /etc/ts-watchdog.sh && echo "  ✅ watchdog чистит сокет" || echo "  ❌ watchdog не чистит сокет"
+
+# Check 6: direct_domains  
+DD=$(uci show podkop.settings.direct_domains 2>/dev/null | grep -c tailscale)
+[ "$DD" -ge 3 ] && echo "  ✅ direct_domains: $DD из 3" || echo "  ⚠️ direct_domains: $DD из 3"
+
+echo ""
+echo "━━━ Если все ✅ — Tailscale переживёт перезагрузку ━━━"
 echo ""

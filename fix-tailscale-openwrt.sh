@@ -285,7 +285,8 @@ echo ""
 echo "━━━ [6/11] Watchdog'ы: podkop + route ━━━"
 cat > /etc/podkop-watchdog.sh << 'PEOF'
 #!/bin/sh
-ps | grep -q "sing-box" || /etc/init.d/podkop restart
+# v3.3: используем start (идемпотентно), не restart (рвёт сеть + Tailscale)
+pgrep sing-box > /dev/null || /etc/init.d/podkop start
 PEOF
 chmod +x /etc/podkop-watchdog.sh
 
@@ -306,11 +307,10 @@ echo ""
 echo "━━━ [7/11] Crontab — watchdog каждые 2 мин ━━━"
 (crontab -l 2>/dev/null | grep -v -E '(ts-watchdog|podkop-watchdog|route-watchdog)'
  echo "*/2 * * * * /etc/ts-watchdog.sh"
- echo "*/2 * * * * /etc/podkop-watchdog.sh"
  echo "*/2 * * * * /etc/route-watchdog.sh"
  echo "13 */3 * * * /usr/bin/podkop list_update"
 ) | crontab -
-echo "  ✅ Crontab обновлён (3 watchdog + list_update)"
+echo "  ✅ Crontab обновлён (2 watchdog + list_update, podkop-watchdog в rc.local)"
 echo ""
 
 # ===== ШАГ 8: tailscale0 в LAN зону (БЕЗ firewall reload!) =====
@@ -399,7 +399,7 @@ grep -q 'ts-watchdog.sh &' /etc/rc.local 2>/dev/null && echo "  ✅ [4] rc.local
 [ -x /etc/route-watchdog.sh ] && echo "  ✅ [6] route-watchdog.sh — установлен" || echo "  ❌ [6] route-watchdog.sh — отсутствует"
 
 crontab -l 2>/dev/null | grep -q ts-watchdog && echo "  ✅ [7] ts-watchdog — в crontab" || echo "  ❌ [7] ts-watchdog — нет в crontab"
-crontab -l 2>/dev/null | grep -q podkop-watchdog && echo "  ✅ [7] podkop-watchdog — в crontab" || echo "  ❌ [7] podkop-watchdog — нет в crontab"
+grep -q 'podkop-watchdog' /etc/rc.local 2>/dev/null && echo "  ✅ [7] podkop-watchdog — в rc.local" || echo "  ❌ [7] podkop-watchdog — нет в rc.local"
 crontab -l 2>/dev/null | grep -q route-watchdog && echo "  ✅ [7] route-watchdog — в crontab" || echo "  ❌ [7] route-watchdog — нет в crontab"
 
 FW_DEV=$(uci get firewall.@zone[0].device 2>/dev/null)

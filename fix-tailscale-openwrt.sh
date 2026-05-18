@@ -2,7 +2,12 @@
 # Tailscale + Podkop repair for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v3.2 — 2026-05-11 — IRON RULES COMPLIANT
+# v3.3 — 2026-05-18 — state-aware rc.local, reboot-proof
+#
+# Changelog v3.3:
+# - После записи rc.local: если state-файл есть → убрать --reset и authkey
+# - tailscale up теперь с & (не блокирует загрузку)
+# - Не перезаписывает авторизацию если Tailscale уже был онлайн
 # - Шаг 0: проверка что Tailscale уже онлайн → если да, ничего не делаем
 # - Шаг 1: fw_mode=none
 # - Шаг 2: ulimit + sysctl лимиты
@@ -165,10 +170,10 @@ nft add rule inet fw4 forward ip saddr 100.64.0.0/10 counter accept 2>/dev/null
 # === ОЧИСТКА СТАРОГО СОКЕТА ===
 rm -f /var/run/tailscale/tailscaled.sock
 
-# === TAILSCALE STARTUP (синхронно — без &) ===
+# === TAILSCALE STARTUP (с & — не блокирует загрузку) ===
 tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
 sleep 3
-tailscale up --reset --authkey=$TS_AUTH_KEY --hostname=$ROUTER_HOSTNAME --accept-routes --accept-dns=false --netfilter-mode=off
+tailscale up --reset --authkey=$TS_AUTH_KEY --hostname=$ROUTER_HOSTNAME --accept-routes --accept-dns=false --netfilter-mode=off &
 
 # === fw4-fix ===
 if [ -x /root/podkop-fw4-fix.sh ]; then
@@ -184,6 +189,12 @@ exit 0
 RCEOF
 chmod +x /etc/rc.local
 cp /etc/rc.local /etc/rc.local.bak 2>/dev/null
+
+# v3.3: Если state-файл уже есть — убрать --reset и authkey (роутер уже авторизован)
+if [ -f /etc/tailscale/tailscaled.state ]; then
+    sed -i "s/tailscale up --reset --authkey=[^ ]* --hostname=[^ ]*/tailscale up --accept-dns=false --accept-routes \&/" /etc/rc.local
+    echo "  ✅ rc.local: state found — removed --reset (reboot-safe)"
+fi
 echo "  ✅ rc.local — timeout 120s + fw4-fix + watchdog"
 echo ""
 

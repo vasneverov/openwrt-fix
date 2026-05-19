@@ -2,8 +2,10 @@
 # Tailscale + Podkop repair for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v3.4 — 2026-05-19 — reboot-proof: исправлен rc.local (лишний &), ts-watchdog без race, точка не плавает
+# v3.5 — 2026-05-19 — user_domain_list_type удаляется автоматически
 #
+# Changelog v3.5 (2026-05-19):
+# - user_domain_list_type удаляется автоматически (раньше только проверял, писал "УДАЛИТЬ!", но не удалял)
 # Changelog v3.4 (2026-05-19):
 # - RC: tailscale up — вся строка заменяется целиком. Баг v3.3: sed менял только часть, хвост оставался → битая команда
 # - RC: флаг /tmp/rc-local-running — watchdog не лезет в tailscale пока rc.local не закончил
@@ -30,7 +32,7 @@
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   Tailscale + Podkop Repair Tool v3.4 (19.05.2026)     ║"
+echo "║   Tailscale + Podkop Repair Tool v3.5 (19.05.2026)     ║"
 echo "║   IRON RULES COMPLIANT — не ломает работающий TS    ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
@@ -106,6 +108,14 @@ echo "  ✅ exclude_ntp = 1"
 echo "  ✅ mixed_proxy_enabled = 0"
 echo "  ✅ enable_output_network_interface = 1"
 echo "  ✅ direct_domains = tailscale.com + controlplane + login"
+
+# v3.5: Удаляем user_domain_list_type — блокирует Tailscale
+if uci get podkop.main.user_domain_list_type >/dev/null 2>&1; then
+    uci delete podkop.main.user_domain_list_type 2>/dev/null
+    echo "  ✅ user_domain_list_type: удалён (блокировал Tailscale)"
+else
+    echo "  ✅ user_domain_list_type: отсутствует"
+fi
 echo ""
 
 # ===== ШАГ 3.5: WAN ifname (podkop использует ifname, а не device) =====
@@ -478,9 +488,9 @@ echo ""
 echo "━━━ ДИАГНОСТИКА: reboot-proof ━━━"
 echo ""
 
-# Check 1: no user_domain_list_type
-if uci get podkop.main.user_domain_list_type 2>/dev/null; then
-    echo "  ❌ user_domain_list_type = $(uci get podkop.main.user_domain_list_type) — УДАЛИТЬ!"
+# Check 1: no user_domain_list_type (v3.5 — удаляется автоматически)
+if uci get podkop.main.user_domain_list_type >/dev/null 2>&1; then
+    echo "  ❌ user_domain_list_type = $(uci get podkop.main.user_domain_list_type) — НЕ УДАЛИЛСЯ! Ошибка скрипта."
 else
     echo "  ✅ user_domain_list_type: отсутствует"
 fi

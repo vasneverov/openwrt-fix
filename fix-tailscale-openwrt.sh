@@ -2,8 +2,13 @@
 # Tailscale + Podkop repair for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v3.3 — 2026-05-18 — state-aware rc.local, reboot-proof
+# v3.4 — 2026-05-19 — reboot-proof: исправлен rc.local (лишний &), ts-watchdog без race, точка не плавает
 #
+# Changelog v3.4 (2026-05-19):
+# - RC: tailscale up — вся строка заменяется целиком (sed -i "/^tailscale up /c\..."). Баг v3.3: sed менял только часть, хвост "--accept-routes --accept-dns=false --netfilter-mode=off" оставался → битая команда
+# - RC: флаг /tmp/rc-local-running — watchdog не лезет в tailscale пока rc.local не закончил
+# - Watchdog: tailscale up с --netfilter-mode=off (иначе при перезапуске флаг теряется)
+# - Watchdog: lock-файл чистится при выходе по rc-local-running
 # Changelog v3.3:
 # - После записи rc.local: если state-файл есть → убрать --reset и authkey
 # - tailscale up теперь с & (не блокирует загрузку)
@@ -162,6 +167,9 @@ echo "━━━ [4b/11] rc.local — timeout + fw4-fix + watchdog ━━━"
 cat > /etc/rc.local << RCEOF
 #!/bin/sh
 
+# === СТАРТ: флаг для watchdog (не дёргать tailscale пока rc.local не закончил) ===
+touch /tmp/rc-local-running
+
 # === NFTABLES: Tailscale прямые маршруты ===
 nft add rule inet fw4 forward ip daddr 100.64.0.0/10 counter accept 2>/dev/null
 nft add rule inet fw4 forward ip daddr 192.200.0.0/24 counter accept 2>/dev/null
@@ -184,15 +192,22 @@ fi
 # === WATCHDOG В ФОНЕ ===
 /etc/ts-watchdog.sh &
 
+# === КОНЕЦ: флаг снят ===
+rm -f /tmp/rc-local-running
+
 logger -t rc.local 'rc.local complete'
 exit 0
 RCEOF
 chmod +x /etc/rc.local
 cp /etc/rc.local /etc/rc.local.bak 2>/dev/null
 
-# v3.3: Если state-файл уже есть — убрать --reset и authkey (роутер уже авторизован)
+# v3.4: Заменяем ВСЮ строку tailscale up, но сохраняем --hostname (если есть)
 if [ -f /etc/tailscale/tailscaled.state ]; then
-    sed -i "s/tailscale up --reset --authkey=[^ ]* --hostname=[^ ]*/tailscale up --accept-dns=false --accept-routes \&/" /etc/rc.local
+    # Читаем hostname из текущей строки, если есть
+    CUR_HOST=$(grep "^tailscale up" /etc/rc.local | grep -o "hostname=[^ &]*" | head -1)
+    HOST_FLAG=""
+    [ -n "$CUR_HOST" ] && HOST_FLAG=" $CUR_HOST"
+    sed -i "/^tailscale up /c\\tailscale up --accept-dns=false --accept-routes --netfilter-mode=off$HOST_FLAG \\&" /etc/rc.local
     echo "  ✅ rc.local: state found — removed --reset (reboot-safe)"
 fi
 echo "  ✅ rc.local — timeout 120s + fw4-fix + watchdog"
@@ -212,6 +227,12 @@ cat > /etc/ts-watchdog.sh << 'WEOF'
 
 LOCKFILE=/tmp/ts-watchdog.lock
 
+# v3.4: Не запускаться пока rc.local выполняется
+if [ -f /tmp/rc-local-running ]; then
+    rm -f "$LOCKFILE"
+    exit 0
+fi
+
 if [ -f "$LOCKFILE" ]; then
     LOCKPID=$(cat "$LOCKFILE" 2>/dev/null)
     if kill -0 "$LOCKPID" 2>/dev/null; then
@@ -225,7 +246,7 @@ if ! ps | grep -q "tailscaled --state="; then
     rm -f /var/run/tailscale/tailscaled.sock
     tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
     sleep 5
-    tailscale up --accept-dns=false --accept-routes &
+    tailscale up --accept-dns=false --accept-routes --netfilter-mode=off &
     logger -t ts-watchdog "tailscaled restarted"
     rm -f "$LOCKFILE"
     exit 0
@@ -243,7 +264,7 @@ if echo "$TS_STATUS" | grep -q "NoState"; then
     tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
     sleep 5
     date +%s > /tmp/ts-up-start
-    tailscale up --accept-dns=false --accept-routes &
+    tailscale up --accept-dns=false --accept-routes --netfilter-mode=off &
     logger -t ts-watchdog "tailscaled fully restarted (NoState fix)"
     rm -f "$LOCKFILE"
     exit 0

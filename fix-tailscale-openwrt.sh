@@ -5,9 +5,10 @@
 # v3.4 — 2026-05-19 — reboot-proof: исправлен rc.local (лишний &), ts-watchdog без race, точка не плавает
 #
 # Changelog v3.4 (2026-05-19):
-# - RC: tailscale up — вся строка заменяется целиком (sed -i "/^tailscale up /c\..."). Баг v3.3: sed менял только часть, хвост "--accept-routes --accept-dns=false --netfilter-mode=off" оставался → битая команда
+# - RC: tailscale up — вся строка заменяется целиком. Баг v3.3: sed менял только часть, хвост оставался → битая команда
 # - RC: флаг /tmp/rc-local-running — watchdog не лезет в tailscale пока rc.local не закончил
 # - Watchdog: tailscale up с --netfilter-mode=off (иначе при перезапуске флаг теряется)
+# - Watchdog: grep "[t]ailscaled" вместо "tailscaled --state=" (statedir vs state). Баг: watchdog перезапускал tailscaled каждые 2 мин!
 # - Watchdog: lock-файл чистится при выходе по rc-local-running
 # Changelog v3.3:
 # - После записи rc.local: если state-файл есть → убрать --reset и authkey
@@ -241,7 +242,8 @@ if [ -f "$LOCKFILE" ]; then
 fi
 echo $$ > "$LOCKFILE"
 
-if ! ps | grep -q "tailscaled --state="; then
+# v3.4 fix: tailscaled запущен с --statedir=, ищем просто процесс
+if ! ps | grep -q "[t]ailscaled"; then
     logger -t ts-watchdog "tailscaled not running, restarting..."
     rm -f /var/run/tailscale/tailscaled.sock
     tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
@@ -378,7 +380,8 @@ echo ""
 # ===== ШАГ 11: Запуск tailscale если не онлайн =====
 echo "━━━ [11/11] Запуск Tailscale ━━━"
 if [ "$TS_ONLINE" -eq 0 ]; then
-    if ! ps | grep -q "tailscaled --state="; then
+    # v3.4 fix: tailscaled с --statedir=
+    if ! ps | grep -q "[t]ailscaled"; then
         echo "  🚀 Запуск tailscaled..."
         tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
         sleep 3

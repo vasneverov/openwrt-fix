@@ -2,8 +2,10 @@
 # Tailscale + Podkop repair for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v3.6 — 2026-05-19 — фикс hostname= без --, добавлен direct_domains.txt
+# v3.7 — 2026-05-20 — fw4 reload после добавления tailscale0 в LAN зону (LuCI через Tailscale)
 #
+# Changelog v3.7 (2026-05-20):
+# - fw4 reload добавлен в Шаг 8 — теперь LuCI доступна через Tailscale сразу после скрипта
 # Changelog v3.6 (2026-05-19):
 # - CUR_HOST: ищет и --hostname= и hostname= (раньше только hostname= без --)
 # - direct_domains: создаётся /etc/podkop/direct_domains.txt если нет
@@ -36,7 +38,7 @@
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   Tailscale + Podkop Repair Tool v3.6 (19.05.2026)     ║"
+echo "║   Tailscale + Podkop Repair Tool v3.7 (20.05.2026)     ║"
 echo "║   IRON RULES COMPLIANT — не ломает работающий TS    ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
@@ -361,11 +363,12 @@ echo "━━━ [7/11] Crontab — watchdog каждые 2 мин ━━━"
 echo "  ✅ Crontab обновлён (2 watchdog + list_update, podkop-watchdog в rc.local)"
 echo ""
 
-# ===== ШАГ 8: tailscale0 в LAN зону (БЕЗ firewall reload!) =====
-echo "━━━ [8/11] Firewall — tailscale0 в LAN зону ━━━"
+# ===== ШАГ 8: tailscale0 в LAN зону + fw4 reload =====
+echo "━━━ [8/11] Firewall — tailscale0 в LAN зону + fw4 reload ━━━"
 uci set firewall.@zone[0].device='br-lan tailscale0' 2>/dev/null
 uci commit firewall 2>/dev/null
-echo "  ✅ tailscale0 добавлен в LAN зону (только uci commit, без reload)"
+fw4 reload 2>/dev/null
+echo "  ✅ tailscale0 добавлен в LAN зону, fw4 reload выполнен"
 echo ""
 
 # ===== ШАГ 9: init.d/tailscale DISABLED =====
@@ -425,7 +428,7 @@ echo ""
 # ===== ФИНАЛЬНЫЙ ОТЧЁТ =====
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║              ФИНАЛЬНЫЙ ОТЧЁТ УСТАНОВКИ              ║"
-echo "║              Tailscale Repair Tool v3.6             ║"
+echo "║              Tailscale Repair Tool v3.7             ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
 

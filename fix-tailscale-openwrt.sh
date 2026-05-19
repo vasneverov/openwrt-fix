@@ -30,7 +30,7 @@
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   Tailscale + Podkop Repair Tool v3.4               ║"
+echo "║   Tailscale + Podkop Repair Tool v3.4 (19.05.2026)     ║"
 echo "║   IRON RULES COMPLIANT — не ломает работающий TS    ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""

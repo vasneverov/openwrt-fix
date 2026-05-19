@@ -2,8 +2,12 @@
 # Tailscale + Podkop repair for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v3.7 — 2026-05-20 — fw4 reload после добавления tailscale0 в LAN зону (LuCI через Tailscale)
+# v3.8 — 2026-05-20 — Persistent nftables tailscale bypass (выдерживает fw4 reload и Podkop restart)
 #
+# Changelog v3.8 (2026-05-20):
+# - Шаг 4: /etc/nftables.d/20-tailscale-bypass.nft — persistent fw4 bypass, живёт после fw4 reload
+# - Шаг 4b: PodkopTable mangle_output bypass в rc.local (до tailscaled)
+# - Шаг 5: ts-watchdog v3.8.1 — PodkopTable bypass с retry (ждёт появления таблицы до 30 сек)
 # Changelog v3.7 (2026-05-20):
 # - fw4 reload добавлен в Шаг 8 — теперь LuCI доступна через Tailscale сразу после скрипта
 # Changelog v3.6 (2026-05-19):
@@ -30,7 +34,7 @@
 # - Шаг 5: ts-watchdog v3.1 (lock, NoState fix, podkop-fw4-fix)
 # - Шаг 6: podkop-watchdog + route-watchdog
 # - Шаг 7: crontab (watchdog каждые 2 мин)
-# - Шаг 8: tailscale0 в LAN зону (БЕЗ firewall reload — только uci commit)
+# - Шаг 8: tailscale0 в LAN зону + fw4 reload (LuCI через Tailscale)
 # - Шаг 9: init.d/tailscale DISABLED
 # - Шаг 10: community_lists проверка
 # - Шаг 11: запуск Tailscale если не онлайн
@@ -38,7 +42,7 @@
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   Tailscale + Podkop Repair Tool v3.7 (20.05.2026)     ║"
+echo "║   Tailscale + Podkop Repair Tool v3.8 (20.05.2026)     ║"
 echo "║   IRON RULES COMPLIANT — не ломает работающий TS    ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
@@ -152,8 +156,28 @@ else
 fi
 echo ""
 
-# ===== ШАГ 4: podkop-fw4-fix.sh — nftables fix для fw4 =====
-echo "━━━ [4/11] podkop-fw4-fix.sh — nftables fix для fw4 ━━━"
+# ===== ШАГ 4: Persistent nftables bypass через /etc/nftables.d/ =====
+echo "━━━ [4/11] /etc/nftables.d/20-tailscale-bypass.nft — persistent fw4 bypass ━━━"
+mkdir -p /etc/nftables.d
+cat > /etc/nftables.d/20-tailscale-bypass.nft << 'NFTEOF'
+## Tailscale bypass rules — survive fw4 reload
+chain user_pre_forward {
+    type filter hook forward priority -1; policy accept;
+    ip daddr 100.64.0.0/10 accept
+    ip daddr 192.200.0.0/24 accept
+    ip saddr 100.64.0.0/10 accept
+}
+chain user_pre_output {
+    type filter hook output priority -1; policy accept;
+    ip daddr 100.64.0.0/10 accept
+    ip daddr 192.200.0.0/24 accept
+}
+NFTEOF
+fw4 reload 2>/dev/null
+echo "  ✅ /etc/nftables.d/20-tailscale-bypass.nft создан и применён"
+
+# ===== ШАГ 4a: podkop-fw4-fix.sh — nftables fix для fw4 =====
+echo "━━━ [4a/11] podkop-fw4-fix.sh — nftables fix для fw4 ━━━"
 cat > /root/podkop-fw4-fix.sh << 'FWEOF'
 #!/bin/sh
 # podkop-fw4-fix.sh — добавляет правила nftables для корректной работы podkop с fw4
@@ -202,6 +226,9 @@ touch /tmp/rc-local-running
 nft add rule inet fw4 forward ip daddr 100.64.0.0/10 counter accept 2>/dev/null
 nft add rule inet fw4 forward ip daddr 192.200.0.0/24 counter accept 2>/dev/null
 nft add rule inet fw4 forward ip saddr 100.64.0.0/10 counter accept 2>/dev/null
+# === PodkopTable bypass (Podkop restart стирает эти правила) ===
+nft add rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
+nft add rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
 
 # === ОЧИСТКА СТАРОГО СОКЕТА ===
 rm -f /var/run/tailscale/tailscaled.sock
@@ -242,20 +269,19 @@ echo "  ✅ rc.local — timeout 120s + fw4-fix + watchdog"
 echo ""
 
 
-# ===== ШАГ 5: ts-watchdog v3.1 =====
-echo "━━━ [5/11] ts-watchdog v3.1 — единый, lock, NoState fix ━━━"
+# ===== ШАГ 5: ts-watchdog v3.8.1 =====
+echo "━━━ [5/11] ts-watchdog v3.8.1 — PodkopTable bypass + retry ━━━"
 cat > /etc/ts-watchdog.sh << 'WEOF'
 #!/bin/sh
 
-# === ts-watchdog v3.1 ===
-# Единый watchdog: работает и из rc.local, и из крона
-# Lock-файл: не запускается дважды
-# Не убивает tailscale если он уже онлайн
-# NoState fix: если tailscale status выдаёт NoState — killall tailscaled + запуск заново
+# === ts-watchdog v3.8.1 ===
+# v3.8.1: PodkopTable bypass with retry (ждёт таблицу до 30 сек)
+# v3.8: PodkopTable bypass — перепроверяет и добавляет правила каждые 2 мин
+# v3.4: lock, NoState fix, statedir
 
 LOCKFILE=/tmp/ts-watchdog.lock
 
-# v3.4: Не запускаться пока rc.local выполняется
+# Не запускаться пока rc.local выполняется
 if [ -f /tmp/rc-local-running ]; then
     rm -f "$LOCKFILE"
     exit 0
@@ -269,7 +295,26 @@ if [ -f "$LOCKFILE" ]; then
 fi
 echo $$ > "$LOCKFILE"
 
-# v3.4 fix: tailscaled запущен с --statedir=, ищем просто процесс
+# === v3.8.1: PodkopTable bypass (wait for table, re-add if wiped) ===
+# Podkop restart/list_update регенерирует PodkopTable, стирая наши rules.
+RETRIES=0
+while [ "$RETRIES" -lt 15 ]; do
+  if nft list table inet PodkopTable >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+  RETRIES=$((RETRIES + 1))
+done
+
+if nft list table inet PodkopTable >/dev/null 2>&1; then
+    if ! nft list chain inet PodkopTable mangle_output 2>/dev/null | grep -q "100.64.0.0/10 accept"; then
+        nft add rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
+        nft add rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
+        logger -t ts-watchdog "PodkopTable bypass rules re-added"
+    fi
+fi
+
+# v3.4 fix: tailscaled с --statedir=
 if ! ps | grep -q "[t]ailscaled"; then
     logger -t ts-watchdog "tailscaled not running, restarting..."
     rm -f /var/run/tailscale/tailscaled.sock
@@ -328,7 +373,7 @@ fi
 rm -f "$LOCKFILE"
 WEOF
 chmod +x /etc/ts-watchdog.sh
-echo "  ✅ ts-watchdog v3.1 установлен"
+echo "  ✅ ts-watchdog v3.8.1 установлен"
 echo ""
 
 # ===== ШАГ 6: podkop-watchdog + route-watchdog =====
@@ -428,7 +473,7 @@ echo ""
 # ===== ФИНАЛЬНЫЙ ОТЧЁТ =====
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║              ФИНАЛЬНЫЙ ОТЧЁТ УСТАНОВКИ              ║"
-echo "║              Tailscale Repair Tool v3.7             ║"
+echo "║              Tailscale Repair Tool v3.8             ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
 
@@ -457,6 +502,9 @@ crontab -l 2>/dev/null | grep -q route-watchdog && echo "  ✅ [7] route-watchdo
 
 FW_DEV=$(uci get firewall.@zone[0].device 2>/dev/null)
 echo "$FW_DEV" | grep -q tailscale0 && echo "  ✅ [8] tailscale0 в LAN зоне" || echo "  ❌ [8] tailscale0 НЕ в LAN зоне"
+[ -f /etc/nftables.d/20-tailscale-bypass.nft ] && echo "  ✅ [4] nftables.d — persistent bypass" || echo "  ❌ [4] nftables.d — отсутствует"
+nft list chain inet PodkopTable mangle_output 2>/dev/null | grep -q "100.64.0.0/10 accept" && echo "  ✅ [5] PodkopTable — bypass активен" || echo "  ❌ [5] PodkopTable — bypass отсутствует"
+grep -q "PodkopTable" /etc/rc.local 2>/dev/null && echo "  ✅ [4] rc.local — PodkopTable bypass" || echo "  ❌ [4] rc.local — PodkopTable bypass отсутствует"
 
 if [ -f /etc/init.d/tailscale ]; then
     [ -f /etc/rc.d/S*tailscale ] && echo "  ❌ [9] init.d/tailscale ВКЛЮЧЁН" || echo "  ✅ [9] init.d/tailscale DISABLED"

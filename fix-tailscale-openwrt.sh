@@ -2,7 +2,11 @@
 # Tailscale + Podkop repair for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v3.5 — 2026-05-19 — user_domain_list_type удаляется автоматически
+# v3.6 — 2026-05-19 — фикс hostname= без --, добавлен direct_domains.txt
+#
+# Changelog v3.6 (2026-05-19):
+# - CUR_HOST: ищет и --hostname= и hostname= (раньше только hostname= без --)
+# - direct_domains: создаётся /etc/podkop/direct_domains.txt если нет
 #
 # Changelog v3.5 (2026-05-19):
 # - user_domain_list_type удаляется автоматически (раньше только проверял, писал "УДАЛИТЬ!", но не удалял)
@@ -108,6 +112,17 @@ echo "  ✅ exclude_ntp = 1"
 echo "  ✅ mixed_proxy_enabled = 0"
 echo "  ✅ enable_output_network_interface = 1"
 echo "  ✅ direct_domains = tailscale.com + controlplane + login"
+# v3.6: Создать /etc/podkop/direct_domains.txt если нет (некоторые podkop читают файл)
+mkdir -p /etc/podkop
+if [ ! -f /etc/podkop/direct_domains.txt ]; then
+  cat > /etc/podkop/direct_domains.txt << 'DOMAINS'
+tailscale.com
+controlplane.tailscale.com
+login.tailscale.com
+derp*.tailscale.com
+DOMAINS
+  echo "  ✅ direct_domains.txt создан"
+fi
 
 # v3.5: Удаляем user_domain_list_type — блокирует Tailscale
 if uci get podkop.main.user_domain_list_type >/dev/null 2>&1; then
@@ -215,7 +230,7 @@ cp /etc/rc.local /etc/rc.local.bak 2>/dev/null
 # v3.4: Заменяем ВСЮ строку tailscale up, но сохраняем --hostname (если есть)
 if [ -f /etc/tailscale/tailscaled.state ]; then
     # Читаем hostname из текущей строки, если есть
-    CUR_HOST=$(grep "^tailscale up" /etc/rc.local | grep -o "hostname=[^ &]*" | head -1)
+    CUR_HOST=$(grep "^tailscale up" /etc/rc.local | grep -o "\-\-hostname=[^ &]*\|hostname=[^ &]*" | head -1)
     HOST_FLAG=""
     [ -n "$CUR_HOST" ] && HOST_FLAG=" $CUR_HOST"
     sed -i "/^tailscale up /c\\tailscale up --accept-dns=false --accept-routes --netfilter-mode=off$HOST_FLAG \\&" /etc/rc.local

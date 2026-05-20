@@ -14,7 +14,7 @@
 # - Шаг 4b+5: nft add rule → nft insert rule для PodkopTable mangle_output (100.64/192.200)
 # - Шаг 5: проверка только первых 3 строк цепочки (head -3) — не путать со старыми add-правилами
 # Changelog v3.9 (2026-05-20):
-# - Шаг 5: ts-watchdog v3.9 — проверка user_domain_list_type каждые 2 мин (удаляет если Podkop восстановил)
+# - Шаг 5: ts-watchdog v3.9.2 — проверка user_domain_list_type каждые 2 мин (удаляет только external, disabled не трогает)
 # - Шаг 4b: rc.local пишется сразу без --reset --authkey (state-файл уже есть). Убран fragile sed-фикс.
 # Changelog v3.8 (2026-05-20):
 # - Шаг 4: /etc/nftables.d/20-tailscale-bypass.nft — persistent fw4 bypass, живёт после fw4 reload
@@ -572,9 +572,12 @@ echo ""
 echo "━━━ ДИАГНОСТИКА: reboot-proof ━━━"
 echo ""
 
-# Check 1: no user_domain_list_type (v3.5 — удаляется, v3.9 — watchdog следит)
-if uci get podkop.main.user_domain_list_type >/dev/null 2>&1; then
-    echo "  ❌ user_domain_list_type = $(uci get podkop.main.user_domain_list_type) — НЕ УДАЛИЛСЯ! Ошибка скрипта."
+# Check 1: user_domain_list_type (v3.9.2 — disabled = норма, другое = удаляем)
+UDT_CHECK=$(uci get podkop.main.user_domain_list_type 2>/dev/null)
+if [ "$UDT_CHECK" = "disabled" ]; then
+    echo "  ✅ user_domain_list_type = disabled (защита подписей от Tailscale IP)"
+elif [ -n "$UDT_CHECK" ]; then
+    echo "  ❌ user_domain_list_type = $UDT_CHECK — надо удалить!"
 else
     echo "  ✅ user_domain_list_type: отсутствует (watchdog следит)"
 fi

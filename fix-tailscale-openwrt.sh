@@ -2,7 +2,7 @@
 # Tailscale + Podkop repair for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v3.9.5 — 2026-05-20 — САМ ставит user_domain_list_type=disabled, применяется ДО Tailscale
+# v3.9.6 — 2026-05-20 — САМ ставит user_domain_list_type=disabled, применяется ДО Tailscale
 #    Если disabled — защищает @podkop_subnets от Tailscale IP, точка держится зелёной.
 #    Удалять только external/другие значения.
 #    PodkopTable mangle_output: правила 100.64.0.0/10 и 192.200.0.0/24 ДОЛЖНЫ быть В НАЧАЛЕ цепочки.
@@ -71,11 +71,23 @@ else
 fi
 echo ""
 
-# ===== ШАГ 1: fw_mode → none =====
+# ===== ШАГ 1: fw_mode → none + tcp_keepalive =====
 echo "━━━ [1/11] fw_mode → none ━━━"
 uci set tailscale.settings.fw_mode='none' 2>/dev/null
 uci commit tailscale 2>/dev/null
 echo "  ✅ fw_mode = none"
+
+# ===== tcp_keepalive_time — фикс 2-min cancel =====
+KEEP=$(sysctl net.ipv4.tcp_keepalive_time 2>/dev/null | awk '{print $NF}')
+if [ "$KEEP" != "7200" ]; then
+    sysctl -w net.ipv4.tcp_keepalive_time=7200 2>/dev/null
+    grep -v "tcp_keepalive_time" /etc/sysctl.conf 2>/dev/null > /tmp/sysctl.tmp
+    echo "net.ipv4.tcp_keepalive_time=7200" >> /tmp/sysctl.tmp
+    cp /tmp/sysctl.tmp /etc/sysctl.conf
+    echo "  ✅ tcp_keepalive_time: $KEEP → 7200"
+else
+    echo "  ✅ tcp_keepalive_time: 7200 (уже)"
+fi
 echo ""
 
 # ===== ШАГ 2: ulimit + sysctl лимиты =====

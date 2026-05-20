@@ -539,7 +539,7 @@ echo ""
 echo "━━━ ТЕСТ: direct_domains + Tailscale ━━━"
 echo ""
 
-DD_COUNT=$(uci show podkop.settings.direct_domains 2>/dev/null | grep -c 'tailscale')
+DD_COUNT=$(uci show podkop.settings.direct_domains 2>/dev/null | grep -o 'tailscale' | wc -l)
 [ "$DD_COUNT" -ge 3 ] && echo "  ✅ direct_domains: $DD_COUNT доменов" || echo "  ⚠️ direct_domains: только $DD_COUNT из 3"
 
 if [ -f /tmp/ts.log ]; then
@@ -587,7 +587,7 @@ grep -q 'tailscale up.*&' /etc/rc.local && echo "  ✅ tailscale up с & (не �
 grep -q 'rm -f /var/run/tailscale/tailscaled.sock' /etc/ts-watchdog.sh && echo "  ✅ watchdog чистит сокет" || echo "  ❌ watchdog не чистит сокет"
 
 # Check 6: direct_domains  
-DD=$(uci show podkop.settings.direct_domains 2>/dev/null | grep -c tailscale)
+DD=$(uci show podkop.settings.direct_domains 2>/dev/null | grep -o 'tailscale' | wc -l)
 [ "$DD" -ge 3 ] && echo "  ✅ direct_domains: $DD из 3" || echo "  ⚠️ direct_domains: $DD из 3"
 
 # Check 7: v3.9 — watchdog умеет удалять user_domain_list_type

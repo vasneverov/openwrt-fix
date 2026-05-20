@@ -2,7 +2,7 @@
 # Tailscale + Podkop repair for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v3.9.2 — 2026-05-20 — user_domain_list_type=disabled НЕ удалять
+# v3.9.3 — 2026-05-20 — v4.0 workflow: ПРИМЕНЯТЬ ДО Tailscale (шаг 5.5), не после
 #    Если disabled — защищает @podkop_subnets от Tailscale IP, точка держится зелёной.
 #    Удалять только external/другие значения.
 #    PodkopTable mangle_output: правила 100.64.0.0/10 и 192.200.0.0/24 ДОЛЖНЫ быть В НАЧАЛЕ цепочки.

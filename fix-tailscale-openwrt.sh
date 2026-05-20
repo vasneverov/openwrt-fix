@@ -103,8 +103,8 @@ nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/
 rm -f "$LOCKFILE"
 WEOF
 chmod +x /etc/ts-watchdog.sh
-(crontab -l 2>/dev/null | grep -v "ts-watchdog"; echo "*/2 * * * * /etc/ts-watchdog.sh") | sort -u | crontab -
-echo "  ✅ watchdog + crontab: каждые 2 мин"
+(crontab -l 2>/dev/null | grep -v "ts-watchdog"; echo "*/1 * * * * /etc/ts-watchdog.sh && /etc/ts-watchdog.sh") | sort -u | crontab -
+echo "  ✅ watchdog: каждые 30 сек"
 
 # 8. sync
 sync

@@ -2,8 +2,15 @@
 # Tailscale + Podkop repair for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v3.9 — 2026-05-20 — user_domain_list_type под наблюдением watchdog + rc.local без --reset --authkey
+# v3.9.1 — 2026-05-20 — CRITICAL FIX: nft add rule → nft insert rule для PodkopTable
+#    PodkopTable mangle_output: правила 100.64.0.0/10 и 192.200.0.0/24 ДОЛЖНЫ быть В НАЧАЛЕ цепочки.
+#    nft add rule добавляет В КОНЕЦ — после @podkop_subnets. Пакет сначала маркируется,
+#    TProxy перехватывает Tailscale heartbeat → серая точка несмотря на bypass.
+#    nft insert rule добавляет В НАЧАЛО — bypass срабатывает до маркировки.
 
+# Changelog v3.9.1 (2026-05-20):
+# - Шаг 4b+5: nft add rule → nft insert rule для PodkopTable mangle_output (100.64/192.200)
+# - Шаг 5: проверка только первых 3 строк цепочки (head -3) — не путать со старыми add-правилами
 # Changelog v3.9 (2026-05-20):
 # - Шаг 5: ts-watchdog v3.9 — проверка user_domain_list_type каждые 2 мин (удаляет если Podkop восстановил)
 # - Шаг 4b: rc.local пишется сразу без --reset --authkey (state-файл уже есть). Убран fragile sed-фикс.
@@ -45,7 +52,7 @@
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   Tailscale + Podkop Repair Tool v3.9 (20.05.2026)     ║"
+echo "║   Tailscale + Podkop Repair Tool v3.9.1 (20.05.2026)   ║"
 echo "║   IRON RULES COMPLIANT — не ломает работающий TS    ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
@@ -226,8 +233,9 @@ nft add rule inet fw4 forward ip daddr 100.64.0.0/10 counter accept 2>/dev/null
 nft add rule inet fw4 forward ip daddr 192.200.0.0/24 counter accept 2>/dev/null
 nft add rule inet fw4 forward ip saddr 100.64.0.0/10 counter accept 2>/dev/null
 # === PodkopTable bypass (Podkop restart стирает эти правила) ===
-nft add rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
-nft add rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
+# ⚠️ INSERT (в начало), не ADD (в конец) — иначе пакет маркируется @podkop_subnets ДО bypass
+nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
+nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
 
 # === ОЧИСТКА СТАРОГО СОКЕТА ===
 rm -f /var/run/tailscale/tailscaled.sock
@@ -296,6 +304,9 @@ fi
 
 # === v3.8.1: PodkopTable bypass (wait for table, re-add if wiped) ===
 # Podkop restart/list_update регенерирует PodkopTable, стирая наши rules.
+# ⚠️ Используем INSERT (в начало), а не ADD (в конец).
+# Если ADD — правило вставляется ПОСЛЕ @podkop_subnets, пакет уже маркирован,
+# TProxy перехватывает Tailscale heartbeat.
 RETRIES=0
 while [ "$RETRIES" -lt 15 ]; do
   if nft list table inet PodkopTable >/dev/null 2>&1; then
@@ -306,10 +317,10 @@ while [ "$RETRIES" -lt 15 ]; do
 done
 
 if nft list table inet PodkopTable >/dev/null 2>&1; then
-    if ! nft list chain inet PodkopTable mangle_output 2>/dev/null | grep -q "100.64.0.0/10 accept"; then
-        nft add rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
-        nft add rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
-        logger -t ts-watchdog "PodkopTable bypass rules re-added"
+    if ! nft list chain inet PodkopTable mangle_output 2>/dev/null | head -3 | grep -q "100.64.0.0/10 accept"; then
+        nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
+        nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
+        logger -t ts-watchdog "PodkopTable bypass rules INSERTED (v3.9.1)"
     fi
 fi
 
@@ -472,7 +483,7 @@ echo ""
 # ===== ФИНАЛЬНЫЙ ОТЧЁТ =====
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║              ФИНАЛЬНЫЙ ОТЧЁТ УСТАНОВКИ              ║"
-echo "║              Tailscale Repair Tool v3.9             ║"
+echo "║              Tailscale Repair Tool v3.9.1            ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
 
@@ -584,6 +595,11 @@ grep -q 'user_domain_list_type' /etc/ts-watchdog.sh && echo "  ✅ [5] watchdog 
 
 # Check 8: v3.9 — rc.local без --reset
 grep -q -- '--reset' /etc/rc.local && echo "  ❌ [4b] rc.local — содержит --reset!" || echo "  ✅ [4b] rc.local — без --reset (v3.9)"
+
+# Check 9: v3.9.1 — PodkopTable insert (первые 3 строки)
+nft list chain inet PodkopTable mangle_output 2>/dev/null | head -3 | grep -q "100.64.0.0/10 accept" \
+  && echo "  ✅ [4b/5] PodkopTable — INSERT (в начале цепочки)" \
+  || echo "  ❌ [4b/5] PodkopTable — правила НЕ в начале (ADD в конце?)"
 
 echo ""
 echo "━━━ Если все ✅ — Tailscale переживёт перезагрузку ━━━"

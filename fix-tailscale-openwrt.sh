@@ -1,22 +1,21 @@
 #!/bin/sh
-# Tailscale + Podkop repair for OpenWrt
+# Tailscale + Podkop fix for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v4.0 — 2026-05-20 — Чистая версия: только доказанные фиксы + watchdog
-#
-# Фиксы:
+# v4.0 — 2026-05-20 — СТАБИЛЬНАЯ версия
 #   - fw_mode=none
-#   - tcp_keepalive_time=7200 (чинит context canceled каждые 2 мин)
-#   - user_domain_list_type=disabled (защита @podkop_subnets от Tailscale IP)
-#   - init.d/tailscale disable
-#   - watchdog: только перезапуск tailscaled если упал (ничего не удаляет, не перезаписывает)
+#   - tcp_keepalive_time=7200
+#   - user_domain_list_type=disabled
+#   - nft bypass для 100.64.0.0/10 и 192.200.0.0/24 в PodkopTable
+#   - rc.local с tailscaled + bypass + init.d ENABLED
+#   - watchdog: перезапуск tailscaled + восстановление bypass
+#   - init.d/tailscale ENABLED (не отключать!)
 #   - sync
-#
-# НЕ делает: rc.local, nftables.d, direct_domains, ulimit, insert/add rule
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   Tailscale Repair v4.0                             ║"
+echo "║   Tailscale Fix v4.0                                ║"
+echo "║   Для применения ДО установки Tailscale (шаг 5.5)   ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
 
@@ -52,62 +51,63 @@ else
     echo "  ✅ user_domain_list_type: NOT SET → disabled"
 fi
 
-# 4. init.d/tailscale disable
-if /etc/init.d/tailscale enabled 2>/dev/null; then
-    /etc/init.d/tailscale disable
-    echo "  ✅ init.d/tailscale: DISABLED"
+# 4. Bypass в PodkopTable
+nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
+nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
+echo "  ✅ Bypass: 192.200.0.0/24 + 100.64.0.0/10 в PodkopTable"
+
+# 5. rc.local — только если не содержит tailscale up
+if grep -q "tailscale up" /etc/rc.local 2>/dev/null; then
+    echo "  ✅ rc.local уже содержит tailscale up — оставляем"
 else
-    echo "  ✅ init.d/tailscale: уже DISABLED"
+    cat > /etc/rc.local << 'EOF'
+#!/bin/sh
+touch /tmp/rc-local-running
+nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
+nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
+rm -f /var/run/tailscale/tailscaled.sock
+tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
+sleep 3
+tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$(uci get system.@system[0].hostname) &
+rm -f /tmp/rc-local-running
+exit 0
+EOF
+    echo "  ✅ rc.local создан с tailscaled + bypass"
 fi
 
-# 5. watchdog — минимальный, только перезапуск tailscaled
+# 6. init.d/tailscale ENABLED
+if /etc/init.d/tailscale enabled 2>/dev/null; then
+    echo "  ✅ init.d/tailscale: уже ENABLED"
+else
+    /etc/init.d/tailscale enable
+    echo "  ✅ init.d/tailscale: включён"
+fi
+
+# 7. watchdog — перезапуск tailscaled + восстановление bypass
 cat > /etc/ts-watchdog.sh << 'WEOF'
 #!/bin/sh
-# ts-watchdog v4.0 — только перезапуск tailscaled если упал
-# НЕ удаляет user_domain_list_type, НЕ добавляет nft правила, НЕ трогает rc.local
-
 LOCKFILE=/tmp/ts-watchdog.lock
 if [ -f "$LOCKFILE" ]; then
     LOCKPID=$(cat "$LOCKFILE" 2>/dev/null)
     if kill -0 "$LOCKPID" 2>/dev/null; then exit 0; fi
 fi
 echo $$ > "$LOCKFILE"
-
-# Если tailscaled не запущен — перезапустить
 if ! ps | grep -q "[t]ailscaled"; then
-    logger -t ts-watchdog "tailscaled не запущен, перезапуск..."
-    rm -f /var/run/tailscale/tailscaled.sock
-    tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
-    sleep 3
-    tailscale up --accept-dns=false --accept-routes --netfilter-mode=off &
-    rm -f "$LOCKFILE"
-    exit 0
-fi
-
-# Проверка: если в NoState больше 5 мин — перезапустить
-TS_LINE=$(tailscale status --self 2>/dev/null | head -1)
-if echo "$TS_LINE" | grep -q "NoState"; then
-    logger -t ts-watchdog "tailscale в NoState, перезапуск..."
-    killall tailscale 2>/dev/null
-    killall tailscaled 2>/dev/null
-    sleep 2
     rm -f /var/run/tailscale/tailscaled.sock
     tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
     sleep 3
     tailscale up --accept-dns=false --accept-routes --netfilter-mode=off &
 fi
-
+nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
+nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
 rm -f "$LOCKFILE"
 WEOF
 chmod +x /etc/ts-watchdog.sh
-echo "  ✅ ts-watchdog v4.0 — только перезапуск tailscaled"
-
-# 6. Crontab — watchdog каждые 2 мин
 (crontab -l 2>/dev/null | grep -v "ts-watchdog"; echo "*/2 * * * * /etc/ts-watchdog.sh") | sort -u | crontab -
-echo "  ✅ crontab: watchdog каждые 2 мин"
+echo "  ✅ watchdog + crontab: каждые 2 мин"
 
-# 7. sync
+# 8. sync
 sync
 echo ""
-echo "  ✅ Готово. Ребутни роутер — точка должна держаться зелёной."
+echo "  ✅ Готово. Ребутни роутер."
 echo ""

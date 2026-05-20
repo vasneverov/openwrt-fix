@@ -2,8 +2,11 @@
 # Tailscale + Podkop repair for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v3.8 — 2026-05-20 — Persistent nftables tailscale bypass (выдерживает fw4 reload и Podkop restart)
-#
+# v3.9 — 2026-05-20 — user_domain_list_type под наблюдением watchdog + rc.local без --reset --authkey
+
+# Changelog v3.9 (2026-05-20):
+# - Шаг 5: ts-watchdog v3.9 — проверка user_domain_list_type каждые 2 мин (удаляет если Podkop восстановил)
+# - Шаг 4b: rc.local пишется сразу без --reset --authkey (state-файл уже есть). Убран fragile sed-фикс.
 # Changelog v3.8 (2026-05-20):
 # - Шаг 4: /etc/nftables.d/20-tailscale-bypass.nft — persistent fw4 bypass, живёт после fw4 reload
 # - Шаг 4b: PodkopTable mangle_output bypass в rc.local (до tailscaled)
@@ -42,7 +45,7 @@
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   Tailscale + Podkop Repair Tool v3.8 (20.05.2026)     ║"
+echo "║   Tailscale + Podkop Repair Tool v3.9 (20.05.2026)     ║"
 echo "║   IRON RULES COMPLIANT — не ломает работающий TS    ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
@@ -208,14 +211,10 @@ chmod +x /root/podkop-fw4-fix.sh
 echo "  ✅ /root/podkop-fw4-fix.sh — создан и применён"
 echo ""
 
-# Извлекаем authkey и hostname из старого rc.local ДО перезаписи
-TS_AUTH_KEY=$(grep 'authkey=' /etc/rc.local 2>/dev/null | grep -o 'authkey=[^ ]*' | cut -d= -f2)
 ROUTER_HOSTNAME=$(uci get system.@system[0].hostname 2>/dev/null || echo "router")
-# Если authkey не найден — используем текущие параметры
-[ -z "$TS_AUTH_KEY" ] && TS_AUTH_KEY=""
 
-# ===== ШАГ 4b: rc.local — с authkey + nftables + watchdog =====
-echo "━━━ [4b/11] rc.local — timeout + fw4-fix + watchdog ━━━"
+# ===== ШАГ 4b: rc.local — v3.9: без --reset --authkey (state уже есть) =====
+echo "━━━ [4b/11] rc.local — v3.9: упрощён ━━━"
 cat > /etc/rc.local << RCEOF
 #!/bin/sh
 
@@ -236,7 +235,7 @@ rm -f /var/run/tailscale/tailscaled.sock
 # === TAILSCALE STARTUP (с & — не блокирует загрузку) ===
 tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
 sleep 3
-tailscale up --reset --authkey=$TS_AUTH_KEY --hostname=$ROUTER_HOSTNAME --accept-routes --accept-dns=false --netfilter-mode=off &
+tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$ROUTER_HOSTNAME &
 
 # === fw4-fix ===
 if [ -x /root/podkop-fw4-fix.sh ]; then
@@ -255,26 +254,17 @@ exit 0
 RCEOF
 chmod +x /etc/rc.local
 cp /etc/rc.local /etc/rc.local.bak 2>/dev/null
-
-# v3.4: Заменяем ВСЮ строку tailscale up, но сохраняем --hostname (если есть)
-if [ -f /etc/tailscale/tailscaled.state ]; then
-    # Читаем hostname из текущей строки, если есть
-    CUR_HOST=$(grep "^tailscale up" /etc/rc.local | grep -o "\-\-hostname=[^ &]*\|hostname=[^ &]*" | head -1)
-    HOST_FLAG=""
-    [ -n "$CUR_HOST" ] && HOST_FLAG=" $CUR_HOST"
-    sed -i "/^tailscale up /c\\tailscale up --accept-dns=false --accept-routes --netfilter-mode=off$HOST_FLAG \\&" /etc/rc.local
-    echo "  ✅ rc.local: state found — removed --reset (reboot-safe)"
-fi
-echo "  ✅ rc.local — timeout 120s + fw4-fix + watchdog"
+echo "  ✅ rc.local — без --reset --authkey (reboot-safe, state уже есть)"
 echo ""
 
 
-# ===== ШАГ 5: ts-watchdog v3.8.1 =====
-echo "━━━ [5/11] ts-watchdog v3.8.1 — PodkopTable bypass + retry ━━━"
+# ===== ШАГ 5: ts-watchdog v3.9 =====
+echo "━━━ [5/11] ts-watchdog v3.9 — PodkopTable + user_domain_list_type ━━━"
 cat > /etc/ts-watchdog.sh << 'WEOF'
 #!/bin/sh
 
-# === ts-watchdog v3.8.1 ===
+# === ts-watchdog v3.9 ===
+# v3.9: user_domain_list_type — проверка и удаление каждые 2 мин
 # v3.8.1: PodkopTable bypass with retry (ждёт таблицу до 30 сек)
 # v3.8: PodkopTable bypass — перепроверяет и добавляет правила каждые 2 мин
 # v3.4: lock, NoState fix, statedir
@@ -294,6 +284,15 @@ if [ -f "$LOCKFILE" ]; then
     fi
 fi
 echo $$ > "$LOCKFILE"
+
+# === v3.9: user_domain_list_type — Podkop может восстановить после list_update/перезагрузки ===
+# Блокирует Tailscale heartbeat → серая точка в админке
+if uci get podkop.main.user_domain_list_type >/dev/null 2>&1; then
+    OLD_VAL=$(uci get podkop.main.user_domain_list_type)
+    uci delete podkop.main.user_domain_list_type
+    uci commit podkop
+    logger -t ts-watchdog "user_domain_list_type='$OLD_VAL' удалён (Podkop восстановил)"
+fi
 
 # === v3.8.1: PodkopTable bypass (wait for table, re-add if wiped) ===
 # Podkop restart/list_update регенерирует PodkopTable, стирая наши rules.
@@ -373,7 +372,7 @@ fi
 rm -f "$LOCKFILE"
 WEOF
 chmod +x /etc/ts-watchdog.sh
-echo "  ✅ ts-watchdog v3.8.1 установлен"
+echo "  ✅ ts-watchdog v3.9 — user_domain_list_type мониторинг добавлен"
 echo ""
 
 # ===== ШАГ 6: podkop-watchdog + route-watchdog =====
@@ -473,7 +472,7 @@ echo ""
 # ===== ФИНАЛЬНЫЙ ОТЧЁТ =====
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║              ФИНАЛЬНЫЙ ОТЧЁТ УСТАНОВКИ              ║"
-echo "║              Tailscale Repair Tool v3.8             ║"
+echo "║              Tailscale Repair Tool v3.9             ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
 
@@ -555,11 +554,11 @@ echo ""
 echo "━━━ ДИАГНОСТИКА: reboot-proof ━━━"
 echo ""
 
-# Check 1: no user_domain_list_type (v3.5 — удаляется автоматически)
+# Check 1: no user_domain_list_type (v3.5 — удаляется, v3.9 — watchdog следит)
 if uci get podkop.main.user_domain_list_type >/dev/null 2>&1; then
     echo "  ❌ user_domain_list_type = $(uci get podkop.main.user_domain_list_type) — НЕ УДАЛИЛСЯ! Ошибка скрипта."
 else
-    echo "  ✅ user_domain_list_type: отсутствует"
+    echo "  ✅ user_domain_list_type: отсутствует (watchdog следит)"
 fi
 
 # Check 2: socket cleanup in rc.local
@@ -579,6 +578,12 @@ grep -q 'rm -f /var/run/tailscale/tailscaled.sock' /etc/ts-watchdog.sh && echo "
 # Check 6: direct_domains  
 DD=$(uci show podkop.settings.direct_domains 2>/dev/null | grep -c tailscale)
 [ "$DD" -ge 3 ] && echo "  ✅ direct_domains: $DD из 3" || echo "  ⚠️ direct_domains: $DD из 3"
+
+# Check 7: v3.9 — watchdog умеет удалять user_domain_list_type
+grep -q 'user_domain_list_type' /etc/ts-watchdog.sh && echo "  ✅ [5] watchdog — мониторинг user_domain_list_type" || echo "  ❌ [5] watchdog — нет мониторинга user_domain_list_type"
+
+# Check 8: v3.9 — rc.local без --reset
+grep -q -- '--reset' /etc/rc.local && echo "  ❌ [4b] rc.local — содержит --reset!" || echo "  ✅ [4b] rc.local — без --reset (v3.9)"
 
 echo ""
 echo "━━━ Если все ✅ — Tailscale переживёт перезагрузку ━━━"

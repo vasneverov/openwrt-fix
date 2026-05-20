@@ -2,7 +2,7 @@
 # Tailscale + Podkop repair for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v3.9.4 — 2026-05-20 — САМ ставит user_domain_list_type=disabled, применяется ДО Tailscale
+# v3.9.5 — 2026-05-20 — САМ ставит user_domain_list_type=disabled, применяется ДО Tailscale
 #    Если disabled — защищает @podkop_subnets от Tailscale IP, точка держится зелёной.
 #    Удалять только external/другие значения.
 #    PodkopTable mangle_output: правила 100.64.0.0/10 и 192.200.0.0/24 ДОЛЖНЫ быть В НАЧАЛЕ цепочки.
@@ -228,8 +228,12 @@ echo ""
 
 ROUTER_HOSTNAME=$(uci get system.@system[0].hostname 2>/dev/null || echo "router")
 
-# ===== ШАГ 4b: rc.local — v3.9: без --reset --authkey (state уже есть) =====
-echo "━━━ [4b/11] rc.local — v3.9: упрощён ━━━"
+# ===== ШАГ 4b: rc.local — только если ещё не содержит tailscale up =====
+echo "━━━ [4b/11] rc.local — проверка ━━━"
+if grep -q "tailscale up" /etc/rc.local 2>/dev/null; then
+    echo "  ✅ rc.local уже содержит tailscale up — не перезаписываем"
+else
+    echo "  ⚠️ rc.local не содержит tailscale up — создаю"
 cat > /etc/rc.local << RCEOF
 #!/bin/sh
 
@@ -271,6 +275,7 @@ RCEOF
 chmod +x /etc/rc.local
 cp /etc/rc.local /etc/rc.local.bak 2>/dev/null
 echo "  ✅ rc.local — без --reset --authkey (reboot-safe, state уже есть)"
+fi
 echo ""
 
 

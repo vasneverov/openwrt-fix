@@ -2,7 +2,9 @@
 # Tailscale + Podkop repair for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v3.9.1 — 2026-05-20 — CRITICAL FIX: nft add rule → nft insert rule для PodkopTable
+# v3.9.2 — 2026-05-20 — user_domain_list_type=disabled НЕ удалять
+#    Если disabled — защищает @podkop_subnets от Tailscale IP, точка держится зелёной.
+#    Удалять только external/другие значения.
 #    PodkopTable mangle_output: правила 100.64.0.0/10 и 192.200.0.0/24 ДОЛЖНЫ быть В НАЧАЛЕ цепочки.
 #    nft add rule добавляет В КОНЕЦ — после @podkop_subnets. Пакет сначала маркируется,
 #    TProxy перехватывает Tailscale heartbeat → серая точка несмотря на bypass.
@@ -140,10 +142,13 @@ DOMAINS
   echo "  ✅ direct_domains.txt создан"
 fi
 
-# v3.5: Удаляем user_domain_list_type — блокирует Tailscale
-if uci get podkop.main.user_domain_list_type >/dev/null 2>&1; then
+# v3.9.2: user_domain_list_type — если disabled, НЕ трогать (защищает @podkop_subnets от Tailscale IP)
+UDT=$(uci get podkop.main.user_domain_list_type 2>/dev/null)
+if [ "$UDT" = "disabled" ]; then
+    echo "  ✅ user_domain_list_type=disabled — оставляем (защита от расширения подписей)"
+elif [ -n "$UDT" ]; then
     uci delete podkop.main.user_domain_list_type 2>/dev/null
-    echo "  ✅ user_domain_list_type: удалён (блокировал Tailscale)"
+    echo "  ✅ user_domain_list_type: удалён ($UDT)"
 else
     echo "  ✅ user_domain_list_type: отсутствует"
 fi
@@ -267,7 +272,7 @@ echo ""
 
 
 # ===== ШАГ 5: ts-watchdog v3.9 =====
-echo "━━━ [5/11] ts-watchdog v3.9 — PodkopTable + user_domain_list_type ━━━"
+echo "━━━ [5/11] ts-watchdog v3.9.2 — PodkopTable + user_domain_list_type ━━━"
 cat > /etc/ts-watchdog.sh << 'WEOF'
 #!/bin/sh
 
@@ -293,13 +298,15 @@ if [ -f "$LOCKFILE" ]; then
 fi
 echo $$ > "$LOCKFILE"
 
-# === v3.9: user_domain_list_type — Podkop может восстановить после list_update/перезагрузки ===
-# Блокирует Tailscale heartbeat → серая точка в админке
+# === v3.9.2: user_domain_list_type — если disabled, НЕ трогать ===
+# disabled защищает @podkop_subnets от расширения на Tailscale IP
 if uci get podkop.main.user_domain_list_type >/dev/null 2>&1; then
-    OLD_VAL=$(uci get podkop.main.user_domain_list_type)
-    uci delete podkop.main.user_domain_list_type
-    uci commit podkop
-    logger -t ts-watchdog "user_domain_list_type='$OLD_VAL' удалён (Podkop восстановил)"
+    UDT_VAL=$(uci get podkop.main.user_domain_list_type)
+    if [ "$UDT_VAL" != "disabled" ]; then
+        uci delete podkop.main.user_domain_list_type
+        uci commit podkop
+        logger -t ts-watchdog "user_domain_list_type='$UDT_VAL' удалён (не disabled)"
+    fi
 fi
 
 # === v3.8.1: PodkopTable bypass (wait for table, re-add if wiped) ===

@@ -2,10 +2,12 @@
 # Tailscale + Podkop fix for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v4.1 — 2026-05-21
+# v4.2 — 2026-05-21
+#   - NEW: resolv.conf → 127.0.0.42 (DNS fix: Podkop слушает на 127.0.0.42, не на 127.0.0.1)
+#   - NEW: nftables.d/20-tailscale-bypass.nft (fw4 reload-safe bypass)
+#   - FIX: проверка rc.local — не только "tailscale up", но и проверка отсутствия serve
 #   - FIX: user_domain_list_type теперь УДАЛЯЕТСЯ (раньше ставился disabled, что давало серую точку)
 #   - FIX: watchdog не плодит дубли nft правил (проверка перед insert + чистка при >5 копиях)
-#   - FIX: watchdog сам чистит UDLT (если Podkop восстановит)
 #   - fw_mode=none
 #   - tcp_keepalive_time=7200
 #   - nft bypass для 100.64.0.0/10 и 192.200.0.0/24 в PodkopTable
@@ -14,8 +16,11 @@
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   Tailscale Fix v4.1 — 2026-05-21                   ║"
-echo "║   FIX: user_domain_list_type УДАЛЯЕТСЯ (не disabled)║"
+echo "║   Tailscale Fix v4.2 — 2026-05-21                   ║"
+echo "║   NEW: DNS fix (resolv.conf → 127.0.0.42)           ║"
+echo "║   NEW: nftables.d/20-tailscale-bypass.nft           ║"
+echo "║   FIX: rc.local проверка serve                      ║"
+echo "║   FIX: user_domain_list_type УДАЛЯЕТСЯ               ║"
 echo "║   FIX: watchdog без дублей nft                      ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
@@ -53,13 +58,63 @@ else
     echo "  ✅ user_domain_list_type: пусто (правильно)"
 fi
 
+# 3.5. DNS fix — Podkop слушает на 127.0.0.42, не на 127.0.0.1
+# Без этого tailscaled не может резолвить controlplane.tailscale.com
+# → long-poll timeout → серая точка в панели
+CURRENT_DNS=$(head -1 /etc/resolv.conf 2>/dev/null)
+if echo "$CURRENT_DNS" | grep -q "127.0.0.42"; then
+    echo "  ✅ resolv.conf: 127.0.0.42 (уже)"
+else
+    echo 'nameserver 127.0.0.42' > /etc/resolv.conf
+    echo 'search lan' >> /etc/resolv.conf
+    chattr +i /etc/resolv.conf 2>/dev/null || true
+    echo "  ✅ resolv.conf: $CURRENT_DNS → 127.0.0.42 (защищён chattr)"
+fi
+
 # 4. Bypass в PodkopTable (один раз)
 nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
 nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
 echo "  ✅ Bypass: 192.200.0.0/24 + 100.64.0.0/10 в PodkopTable"
 
-# 5. rc.local
-if grep -q "tailscale up" /etc/rc.local 2>/dev/null; then
+# 4.5. nftables.d/20-tailscale-bypass.nft (fw4 reload-safe bypass)
+# Спасительный скрипт не меняет rc.local если он уже есть.
+# А старый rc.local может содержать serve hook (26-ка).
+# nftables.d файл переживает fw4 reload.
+mkdir -p /etc/nftables.d
+cat > /etc/nftables.d/20-tailscale-bypass.nft << 'NFTEOF'
+## Tailscale bypass rules — survive fw4 reload
+chain user_pre_forward {
+    type filter hook forward priority -1; policy accept;
+    ip daddr 100.64.0.0/10 accept
+    ip daddr 192.200.0.0/24 accept
+    ip saddr 100.64.0.0/10 accept
+}
+chain user_pre_output {
+    type filter hook output priority -1; policy accept;
+    ip daddr 100.64.0.0/10 accept
+    ip daddr 192.200.0.0/24 accept
+}
+NFTEOF
+fw4 reload 2>/dev/null
+echo "  ✅ /etc/nftables.d/20-tailscale-bypass.nft создан (fw4 reload-safe)"
+
+# 5. rc.local — усиленная проверка
+if grep -q "tailscale serve\|tailscaled --state=" /etc/rc.local 2>/dev/null; then
+    echo "  ⚠️ rc.local содержит serve или кривой tailscaled — ПЕРЕЗАПИСЬ"
+    cat > /etc/rc.local << 'EOF'
+#!/bin/sh
+touch /tmp/rc-local-running
+nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
+nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
+rm -f /var/run/tailscale/tailscaled.sock
+tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
+sleep 3
+tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$(uci get system.@system[0].hostname) &
+rm -f /tmp/rc-local-running
+exit 0
+EOF
+    echo "  ✅ rc.local перезаписан (был serve или кривой)"
+elif grep -q "tailscale up" /etc/rc.local 2>/dev/null; then
     echo "  ✅ rc.local уже содержит tailscale up — оставляем"
 else
     cat > /etc/rc.local << 'EOF'

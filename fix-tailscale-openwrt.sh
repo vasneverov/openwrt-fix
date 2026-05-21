@@ -2,20 +2,21 @@
 # Tailscale + Podkop fix for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v4.0 — 2026-05-20 — СТАБИЛЬНАЯ версия
+# v4.1 — 2026-05-21
+#   - FIX: user_domain_list_type теперь УДАЛЯЕТСЯ (раньше ставился disabled, что давало серую точку)
+#   - FIX: watchdog не плодит дубли nft правил (проверка перед insert + чистка при >5 копиях)
+#   - FIX: watchdog сам чистит UDLT (если Podkop восстановит)
 #   - fw_mode=none
 #   - tcp_keepalive_time=7200
-#   - user_domain_list_type=disabled
 #   - nft bypass для 100.64.0.0/10 и 192.200.0.0/24 в PodkopTable
 #   - rc.local с tailscaled + bypass + init.d ENABLED
-#   - watchdog: перезапуск tailscaled + восстановление bypass
 #   - init.d/tailscale ENABLED (не отключать!)
-#   - sync
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   Tailscale Fix v4.0                                ║"
-echo "║   Для применения ДО установки Tailscale (шаг 5.5)   ║"
+echo "║   Tailscale Fix v4.1 — 2026-05-21                   ║"
+echo "║   FIX: user_domain_list_type УДАЛЯЕТСЯ (не disabled)║"
+echo "║   FIX: watchdog без дублей nft                      ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
 
@@ -36,27 +37,28 @@ else
     echo "  ✅ tcp_keepalive_time: 7200 (уже)"
 fi
 
-# 3. user_domain_list_type=disabled
+# 3. user_domain_list_type — УДАЛИТЬ (не ставить disabled!)
+# disabled = Podkop игнорирует direct_domains → трафик controlplane через TProxy
+# пусто (отсутствует) = direct_domains работают напрямую → heartbeat стабилен
 UDT=$(uci get podkop.main.user_domain_list_type 2>/dev/null)
 if [ "$UDT" = "disabled" ]; then
-    echo "  ✅ user_domain_list_type=disabled — оставляем"
+    uci delete podkop.main.user_domain_list_type
+    uci commit podkop
+    echo "  ✅ user_domain_list_type: disabled → УДАЛЁН (был disabled, а надо пусто)"
 elif [ -n "$UDT" ]; then
-    uci delete podkop.main.user_domain_list_type 2>/dev/null
-    uci set podkop.main.user_domain_list_type=disabled
+    uci delete podkop.main.user_domain_list_type
     uci commit podkop
-    echo "  ✅ user_domain_list_type: $UDT → disabled"
+    echo "  ✅ user_domain_list_type: $UDT → УДАЛЁН"
 else
-    uci set podkop.main.user_domain_list_type=disabled
-    uci commit podkop
-    echo "  ✅ user_domain_list_type: NOT SET → disabled"
+    echo "  ✅ user_domain_list_type: пусто (правильно)"
 fi
 
-# 4. Bypass в PodkopTable
+# 4. Bypass в PodkopTable (один раз)
 nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
 nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
 echo "  ✅ Bypass: 192.200.0.0/24 + 100.64.0.0/10 в PodkopTable"
 
-# 5. rc.local — только если не содержит tailscale up
+# 5. rc.local
 if grep -q "tailscale up" /etc/rc.local 2>/dev/null; then
     echo "  ✅ rc.local уже содержит tailscale up — оставляем"
 else
@@ -83,31 +85,98 @@ else
     echo "  ✅ init.d/tailscale: включён"
 fi
 
-# 7. watchdog — перезапуск tailscaled + восстановление bypass
+# 7. watchdog
 cat > /etc/ts-watchdog.sh << 'WEOF'
 #!/bin/sh
+
+# ts-watchdog v4.1 — 2026-05-21
+# - UDLT-check: удаляет user_domain_list_type если Podkop восстановил
+# - nft bypass: проверка наличия перед insert (не плодит дубли)
+# - чистка дублей: если >5 копий правил — причесывает
+# - lock, grace period, NoState fix
+
 LOCKFILE=/tmp/ts-watchdog.lock
+
+# Grace period — не трогать первые 3 минуты после старта
+UPTIME_SEC=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
+if [ "$UPTIME_SEC" -lt 180 ] && [ -f /tmp/rc-local-running ]; then
+    rm -f "$LOCKFILE"
+    exit 0
+fi
+
 if [ -f "$LOCKFILE" ]; then
     LOCKPID=$(cat "$LOCKFILE" 2>/dev/null)
     if kill -0 "$LOCKPID" 2>/dev/null; then exit 0; fi
 fi
 echo $$ > "$LOCKFILE"
+
+# === UDLT-check: Podkop может восстановить user_domain_list_type при list_update ===
+if uci get podkop.main.user_domain_list_type >/dev/null 2>&1; then
+    OLD_VAL=$(uci get podkop.main.user_domain_list_type)
+    uci delete podkop.main.user_domain_list_type
+    uci commit podkop
+    /etc/init.d/podkop restart 2>/dev/null
+    logger -t ts-watchdog "user_domain_list_type='$OLD_VAL' удалён (Podkop восстановил)"
+fi
+
+# === PodkopTable bypass — проверка + очистка дублей ===
+if nft list table inet PodkopTable >/dev/null 2>&1; then
+    COUNT_100=$(nft list chain inet PodkopTable mangle_output 2>/dev/null | grep -c "100.64.0.0/10 accept")
+    COUNT_192=$(nft list chain inet PodkopTable mangle_output 2>/dev/null | grep -c "192.200.0.0/24 accept")
+
+    if [ "$COUNT_100" -gt 5 ] || [ "$COUNT_192" -gt 5 ]; then
+        # Слишком много дублей — почистить
+        nft flush chain inet PodkopTable mangle_output 2>/dev/null
+        # Восстановить оригинальные правила Podkop
+        /etc/init.d/podkop restart 2>/dev/null
+        sleep 2
+        # Вставить поверх наши bypass
+        nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
+        nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
+        logger -t ts-watchdog "PodkopTable очищен от дублей ($COUNT_100 + $COUNT_192 → 1+1)"
+    elif [ "$COUNT_100" -eq 0 ]; then
+        nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
+        nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
+        logger -t ts-watchdog "PodkopTable bypass rules INSERTED (были сброшены)"
+    fi
+fi
+
+# === tailscaled alive check ===
 if ! ps | grep -q "[t]ailscaled"; then
+    logger -t ts-watchdog "tailscaled not running, restarting..."
     rm -f /var/run/tailscale/tailscaled.sock
     tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
     sleep 3
     tailscale up --accept-dns=false --accept-routes --netfilter-mode=off &
+    logger -t ts-watchdog "tailscaled restarted"
+    rm -f "$LOCKFILE"
+    exit 0
 fi
-nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
-nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
+
+# === NoState check ===
+TS_STATUS=$(tailscale status 2>&1)
+if echo "$TS_STATUS" | grep -q "NoState"; then
+    logger -t ts-watchdog "tailscaled in NoState, full restart..."
+    killall tailscale 2>/dev/null
+    sleep 1
+    killall tailscaled 2>/dev/null
+    sleep 2
+    rm -f /var/run/tailscale/tailscaled.sock
+    tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
+    sleep 5
+    tailscale up --accept-dns=false --accept-routes --netfilter-mode=off &
+    logger -t ts-watchdog "tailscaled fully restarted (NoState fix)"
+fi
+
 rm -f "$LOCKFILE"
 WEOF
 chmod +x /etc/ts-watchdog.sh
-(crontab -l 2>/dev/null | grep -v "ts-watchdog"; echo "*/1 * * * * /etc/ts-watchdog.sh && /etc/ts-watchdog.sh") | sort -u | crontab -
-echo "  ✅ watchdog: каждые 30 сек"
+
+(crontab -l 2>/dev/null | grep -v "ts-watchdog"; echo "*/1 * * * * /etc/ts-watchdog.sh") | sort -u | crontab -
+echo "  ✅ watchdog v4.1: каждую минуту, UDLT-check + nft без дублей"
 
 # 8. sync
 sync
 echo ""
-echo "  ✅ Готово. Ребутни роутер."
+echo "  ✅ Готово v4.1. Рекомендуется ребут."
 echo ""

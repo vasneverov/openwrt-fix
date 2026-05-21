@@ -103,6 +103,9 @@ if grep -q "tailscale serve\|tailscaled --state=" /etc/rc.local 2>/dev/null; the
     echo "  ⚠️ rc.local содержит serve или кривой tailscaled — ПЕРЕЗАПИСЬ"
     cat > /etc/rc.local << 'EOF'
 #!/bin/sh
+# DNS fix — Podkop слушает на 127.0.0.42, не на 127.0.0.1
+echo "nameserver 127.0.0.42" > /etc/resolv.conf
+echo "search lan" >> /etc/resolv.conf
 touch /tmp/rc-local-running
 nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
 nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
@@ -115,7 +118,14 @@ exit 0
 EOF
     echo "  ✅ rc.local перезаписан (был serve или кривой)"
 elif grep -q "tailscale up" /etc/rc.local 2>/dev/null; then
-    echo "  ✅ rc.local уже содержит tailscale up — оставляем"
+    # Проверяем, есть ли DNS fix в rc.local
+    if grep -q "127.0.0.42" /etc/rc.local 2>/dev/null; then
+        echo "  ✅ rc.local уже содержит tailscale up + DNS fix — оставляем"
+    else
+        echo "  ⚠️ rc.local есть, но без DNS fix — добавляем"
+        sed -i '2i# DNS fix — Podkop слушает на 127.0.0.42, не на 127.0.0.1\necho "nameserver 127.0.0.42" > /etc/resolv.conf\necho "search lan" >> /etc/resolv.conf' /etc/rc.local
+        sh -n /etc/rc.local 2>/dev/null && echo "  ✅ DNS fix добавлен в rc.local" || echo "  ❌ rc.local syntax error!"
+    fi
 else
     cat > /etc/rc.local << 'EOF'
 #!/bin/sh

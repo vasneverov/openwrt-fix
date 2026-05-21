@@ -2,7 +2,9 @@
 # Tailscale + Podkop fix for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v4.2 — 2026-05-21
+# v4.3 — 2026-05-21
+#   - FIX: watchdog ТОЛЬКО в rc.local (после tailscale up), НЕ в cron!
+#   - FIX: иначе watchdog циклит NoState → убивает tailscaled → перезапуск
 #   - NEW: resolv.conf → 127.0.0.42 (DNS fix: Podkop слушает на 127.0.0.42, не на 127.0.0.1)
 #   - NEW: nftables.d/20-tailscale-bypass.nft (fw4 reload-safe bypass)
 #   - FIX: проверка rc.local — не только "tailscale up", но и проверка отсутствия serve
@@ -16,10 +18,10 @@
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   Tailscale Fix v4.2 — 2026-05-21                   ║"
+echo "║   Tailscale Fix v4.3 — 2026-05-21                   ║"
+echo "║   FIX: watchdog только в rc.local (не в cron!)       ║"
 echo "║   NEW: DNS fix (resolv.conf → 127.0.0.42)           ║"
-echo "║   NEW: nftables.d/20-tailscale-bypass.nft           ║"
-echo "║   FIX: rc.local проверка serve                      ║"
+echo "║   NEW: nftables.d bypass                            ║"
 echo "║   FIX: user_domain_list_type УДАЛЯЕТСЯ               ║"
 echo "║   FIX: watchdog без дублей nft                      ║"
 echo "╚══════════════════════════════════════════════════════╝"
@@ -113,6 +115,9 @@ rm -f /var/run/tailscale/tailscaled.sock
 tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
 sleep 3
 tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$(uci get system.@system[0].hostname) &
+# watchdog ТОЛЬКО ПОСЛЕ tailscale up (не убивать переходный NoState!)
+sleep 5
+/etc/ts-watchdog.sh &
 rm -f /tmp/rc-local-running
 exit 0
 EOF
@@ -136,6 +141,9 @@ rm -f /var/run/tailscale/tailscaled.sock
 tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
 sleep 3
 tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$(uci get system.@system[0].hostname) &
+# watchdog ТОЛЬКО ПОСЛЕ tailscale up (не убивать переходный NoState!)
+sleep 5
+/etc/ts-watchdog.sh &
 rm -f /tmp/rc-local-running
 exit 0
 EOF
@@ -237,11 +245,12 @@ rm -f "$LOCKFILE"
 WEOF
 chmod +x /etc/ts-watchdog.sh
 
-(crontab -l 2>/dev/null | grep -v "ts-watchdog"; echo "*/1 * * * * /etc/ts-watchdog.sh") | sort -u | crontab -
-echo "  ✅ watchdog v4.1: каждую минуту, UDLT-check + nft без дублей"
+# watchdog НЕ В CRON! Только в rc.local после tailscale up.
+# Иначе watchdog циклит: видит NoState → убивает tailscaled → перезапуск → снова NoState
+echo "  ✅ watchdog v4.2: только в rc.local (после tailscale up), не в cron"
 
 # 8. sync
 sync
 echo ""
-echo "  ✅ Готово v4.1. Рекомендуется ребут."
+echo "  ✅ Готово v4.3. Рекомендуется ребут."
 echo ""

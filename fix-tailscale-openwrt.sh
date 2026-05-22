@@ -2,180 +2,100 @@
 # Tailscale + Podkop fix for OpenWrt
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v4.3 — 2026-05-21
-#   - FIX: watchdog ТОЛЬКО в rc.local (после tailscale up), НЕ в cron!
-#   - FIX: иначе watchdog циклит NoState → убивает tailscaled → перезапуск
-#   - NEW: resolv.conf → 127.0.0.42 (DNS fix: Podkop слушает на 127.0.0.42, не на 127.0.0.1)
-#   - NEW: nftables.d/20-tailscale-bypass.nft (fw4 reload-safe bypass)
-#   - FIX: проверка rc.local — не только "tailscale up", но и проверка отсутствия serve
-#   - FIX: user_domain_list_type теперь УДАЛЯЕТСЯ (раньше ставился disabled, что давало серую точку)
-#   - FIX: watchdog не плодит дубли nft правил (проверка перед insert + чистка при >5 копиях)
-#   - fw_mode=none
-#   - tcp_keepalive_time=7200
-#   - nft bypass для 100.64.0.0/10 и 192.200.0.0/24 в PodkopTable
-#   - rc.local с tailscaled + bypass + init.d ENABLED
-#   - init.d/tailscale ENABLED (не отключать!)
+# v5.0 — 2026-05-22
+#   ПОЛНАЯ ПЕРЕРАБОТКА по урокам M56-26/27/28
+#   - FIX: init.d DISABLED (не ENABLED!) — иначе 2 процесса → конфликт state → серая точка
+#   - FIX: watchdog В CRON каждую минуту (раньше только в rc.local — недостаточно)
+#   - FIX: убран DNS hack resolv.conf→127.0.0.42 (ломал DNS)
+#   - FIX: убраны nftables bypass (не нужны с --netfilter-mode=off)
+#   - NEW: state backup + restore логика в rc.local
+#   - NEW: --hostname в tailscale up и watchdog
+#   - NEW: проверка версии бинаря (нужна 1.96.5 OPX)
+#   - NEW: podkop-watchdog + podkop-fix-lists в cron
+
+HOSTNAME_VAL=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   Tailscale Fix v4.3 — 2026-05-21                   ║"
-echo "║   FIX: watchdog только в rc.local (не в cron!)       ║"
-echo "║   NEW: DNS fix (resolv.conf → 127.0.0.42)           ║"
-echo "║   NEW: nftables.d bypass                            ║"
-echo "║   FIX: user_domain_list_type УДАЛЯЕТСЯ               ║"
-echo "║   FIX: watchdog без дублей nft                      ║"
+echo "║   Tailscale Fix v5.0 — 2026-05-22                   ║"
+printf "║   Роутер: %-43s║\n" "$HOSTNAME_VAL"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
 
-# 1. fw_mode=none
+# 1. Проверка версии бинаря
+TS_VER=$(tailscale version 2>/dev/null | head -1 | awk '{print $1}')
+if [ "$TS_VER" = "1.96.5" ]; then
+    echo "  ✅ tailscale version: $TS_VER (OPX — правильная)"
+else
+    echo "  ⚠️  tailscale version: $TS_VER (нужна 1.96.5 OPX!)"
+    echo "     После скрипта скопируй бинарь с Мака:"
+    echo "       cat /tmp/tailscaled-196 | ssh root@192.168.5.1 'cat > /usr/sbin/tailscaled && chmod +x /usr/sbin/tailscaled'"
+    echo "     Иначе после ребута точка будет серой!"
+fi
+
+# 2. fw_mode=none + autoupdate=false
 uci set tailscale.settings.fw_mode='none' 2>/dev/null
+uci set tailscale.settings.autoupdate='false' 2>/dev/null
 uci commit tailscale 2>/dev/null
-echo "  ✅ fw_mode = none"
+echo "  ✅ fw_mode=none, autoupdate=false"
 
-# 2. tcp_keepalive_time=7200
-KEEP=$(sysctl net.ipv4.tcp_keepalive_time 2>/dev/null | awk '{print $NF}')
-if [ "$KEEP" != "7200" ]; then
-    sysctl -w net.ipv4.tcp_keepalive_time=7200 >/dev/null 2>&1
-    grep -v "tcp_keepalive_time" /etc/sysctl.conf 2>/dev/null > /tmp/sysctl.tmp
-    echo "net.ipv4.tcp_keepalive_time=7200" >> /tmp/sysctl.tmp
-    cp /tmp/sysctl.tmp /etc/sysctl.conf
-    echo "  ✅ tcp_keepalive_time: $KEEP → 7200"
+# 3. init.d DISABLED (КРИТИЧНО — иначе 2 процесса tailscaled → конфликт state)
+/etc/init.d/tailscale stop 2>/dev/null
+/etc/init.d/tailscale disable 2>/dev/null
+echo "  ✅ init.d/tailscale: DISABLED"
+
+# 4. State backup
+mkdir -p /etc/tailscale /var/run/tailscale
+STATE_SIZE=$(wc -c < /etc/tailscale/tailscaled.state 2>/dev/null || echo 0)
+if [ "$STATE_SIZE" -gt 1000 ]; then
+    cp /etc/tailscale/tailscaled.state /root/tailscaled.state.backup
+    echo "  ✅ state backup: $STATE_SIZE байт → /root/tailscaled.state.backup"
 else
-    echo "  ✅ tcp_keepalive_time: 7200 (уже)"
-fi
-
-# 3. user_domain_list_type — УДАЛИТЬ (не ставить disabled!)
-# disabled = Podkop игнорирует direct_domains → трафик controlplane через TProxy
-# пусто (отсутствует) = direct_domains работают напрямую → heartbeat стабилен
-UDT=$(uci get podkop.main.user_domain_list_type 2>/dev/null)
-if [ "$UDT" = "disabled" ]; then
-    uci delete podkop.main.user_domain_list_type
-    uci commit podkop
-    echo "  ✅ user_domain_list_type: disabled → УДАЛЁН (был disabled, а надо пусто)"
-elif [ -n "$UDT" ]; then
-    uci delete podkop.main.user_domain_list_type
-    uci commit podkop
-    echo "  ✅ user_domain_list_type: $UDT → УДАЛЁН"
-else
-    echo "  ✅ user_domain_list_type: пусто (правильно)"
-fi
-
-# 3.5. DNS fix — Podkop слушает на 127.0.0.42, не на 127.0.0.1
-# Без этого tailscaled не может резолвить controlplane.tailscale.com
-# → long-poll timeout → серая точка в панели
-CURRENT_DNS=$(head -1 /etc/resolv.conf 2>/dev/null)
-if echo "$CURRENT_DNS" | grep -q "127.0.0.42"; then
-    echo "  ✅ resolv.conf: 127.0.0.42 (уже)"
-else
-    echo 'nameserver 127.0.0.42' > /etc/resolv.conf
-    echo 'search lan' >> /etc/resolv.conf
-    chattr +i /etc/resolv.conf 2>/dev/null || true
-    echo "  ✅ resolv.conf: $CURRENT_DNS → 127.0.0.42 (защищён chattr)"
-fi
-
-# 4. Bypass в PodkopTable (один раз)
-nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
-nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
-echo "  ✅ Bypass: 192.200.0.0/24 + 100.64.0.0/10 в PodkopTable"
-
-# 4.5. nftables.d/20-tailscale-bypass.nft (fw4 reload-safe bypass)
-# Спасительный скрипт не меняет rc.local если он уже есть.
-# А старый rc.local может содержать serve hook (26-ка).
-# nftables.d файл переживает fw4 reload.
-mkdir -p /etc/nftables.d
-cat > /etc/nftables.d/20-tailscale-bypass.nft << 'NFTEOF'
-## Tailscale bypass rules — survive fw4 reload
-chain user_pre_forward {
-    type filter hook forward priority -1; policy accept;
-    ip daddr 100.64.0.0/10 accept
-    ip daddr 192.200.0.0/24 accept
-    ip saddr 100.64.0.0/10 accept
-}
-chain user_pre_output {
-    type filter hook output priority -1; policy accept;
-    ip daddr 100.64.0.0/10 accept
-    ip daddr 192.200.0.0/24 accept
-}
-NFTEOF
-fw4 reload 2>/dev/null
-echo "  ✅ /etc/nftables.d/20-tailscale-bypass.nft создан (fw4 reload-safe)"
-
-# 5. rc.local — усиленная проверка
-if grep -q "tailscale serve\|tailscaled --state=" /etc/rc.local 2>/dev/null; then
-    echo "  ⚠️ rc.local содержит serve или кривой tailscaled — ПЕРЕЗАПИСЬ"
-    cat > /etc/rc.local << 'EOF'
-#!/bin/sh
-# DNS fix — Podkop слушает на 127.0.0.42, не на 127.0.0.1
-echo "nameserver 127.0.0.42" > /etc/resolv.conf
-echo "search lan" >> /etc/resolv.conf
-touch /tmp/rc-local-running
-nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
-nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
-rm -f /var/run/tailscale/tailscaled.sock
-tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
-sleep 3
-tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$(uci get system.@system[0].hostname) &
-# watchdog ТОЛЬКО ПОСЛЕ tailscale up (не убивать переходный NoState!)
-sleep 5
-/etc/ts-watchdog.sh &
-rm -f /tmp/rc-local-running
-exit 0
-EOF
-    echo "  ✅ rc.local перезаписан (был serve или кривой)"
-elif grep -q "tailscale up" /etc/rc.local 2>/dev/null; then
-    # Проверяем, есть ли DNS fix в rc.local
-    if grep -q "127.0.0.42" /etc/rc.local 2>/dev/null; then
-        echo "  ✅ rc.local уже содержит tailscale up + DNS fix — оставляем"
-    else
-        echo "  ⚠️ rc.local есть, но без DNS fix — добавляем"
-        sed -i '2i# DNS fix — Podkop слушает на 127.0.0.42, не на 127.0.0.1\necho "nameserver 127.0.0.42" > /etc/resolv.conf\necho "search lan" >> /etc/resolv.conf' /etc/rc.local
-        sh -n /etc/rc.local 2>/dev/null && echo "  ✅ DNS fix добавлен в rc.local" || echo "  ❌ rc.local syntax error!"
+    echo "  ⚠️  state мал ($STATE_SIZE байт) — роутер не авторизован в Tailscale"
+    if [ -f /root/tailscaled.state.backup ]; then
+        echo "     Есть backup: $(wc -c < /root/tailscaled.state.backup) байт"
     fi
-else
-    cat > /etc/rc.local << 'EOF'
+fi
+
+# 5. rc.local — правильный (без --reset, без --authkey, с state restore)
+cat > /etc/rc.local << RCEOF
 #!/bin/sh
-touch /tmp/rc-local-running
-nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
-nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
+# rc.local v5.0 — 2026-05-22
+
+# init.d disable (на случай если что-то включило)
+/etc/init.d/tailscale disable 2>/dev/null
+
+# Restore state from backup if current is small/corrupted
+if [ -f /root/tailscaled.state.backup ]; then
+    CURR=\$(wc -c < /etc/tailscale/tailscaled.state 2>/dev/null || echo 0)
+    if [ "\$CURR" -lt 1000 ]; then
+        cp /root/tailscaled.state.backup /etc/tailscale/tailscaled.state
+        logger -t rc.local 'state restored from backup'
+    fi
+fi
+
+# Start tailscaled (один процесс, userspace)
+mkdir -p /var/run/tailscale
 rm -f /var/run/tailscale/tailscaled.sock
 tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
-sleep 3
-tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$(uci get system.@system[0].hostname) &
-# watchdog ТОЛЬКО ПОСЛЕ tailscale up (не убивать переходный NoState!)
 sleep 5
-/etc/ts-watchdog.sh &
-rm -f /tmp/rc-local-running
+
+# Bring up Tailscale (saved state — NO --reset, NO --authkey)
+tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$HOSTNAME_VAL &
+
+logger -t rc.local 'Tailscale started'
 exit 0
-EOF
-    echo "  ✅ rc.local создан с tailscaled + bypass"
-fi
+RCEOF
+chmod +x /etc/rc.local
+echo "  ✅ rc.local записан (hostname=$HOSTNAME_VAL, без --reset, с state restore)"
 
-# 6. init.d/tailscale ENABLED
-if /etc/init.d/tailscale enabled 2>/dev/null; then
-    echo "  ✅ init.d/tailscale: уже ENABLED"
-else
-    /etc/init.d/tailscale enable
-    echo "  ✅ init.d/tailscale: включён"
-fi
-
-# 7. watchdog
+# 6. ts-watchdog v5.0
 cat > /etc/ts-watchdog.sh << 'WEOF'
 #!/bin/sh
+# ts-watchdog v5.0 — 2026-05-22
 
-# ts-watchdog v4.1 — 2026-05-21
-# - UDLT-check: удаляет user_domain_list_type если Podkop восстановил
-# - nft bypass: проверка наличия перед insert (не плодит дубли)
-# - чистка дублей: если >5 копий правил — причесывает
-# - lock, grace period, NoState fix
-
+HOSTNAME_VAL=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 LOCKFILE=/tmp/ts-watchdog.lock
-
-# Grace period — не трогать первые 3 минуты после старта
-UPTIME_SEC=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
-if [ "$UPTIME_SEC" -lt 180 ] && [ -f /tmp/rc-local-running ]; then
-    rm -f "$LOCKFILE"
-    exit 0
-fi
 
 if [ -f "$LOCKFILE" ]; then
     LOCKPID=$(cat "$LOCKFILE" 2>/dev/null)
@@ -183,74 +103,106 @@ if [ -f "$LOCKFILE" ]; then
 fi
 echo $$ > "$LOCKFILE"
 
-# === UDLT-check: Podkop может восстановить user_domain_list_type при list_update ===
-if uci get podkop.main.user_domain_list_type >/dev/null 2>&1; then
-    OLD_VAL=$(uci get podkop.main.user_domain_list_type)
-    uci delete podkop.main.user_domain_list_type
-    uci commit podkop
-    /etc/init.d/podkop restart 2>/dev/null
-    logger -t ts-watchdog "user_domain_list_type='$OLD_VAL' удалён (Podkop восстановил)"
-fi
-
-# === PodkopTable bypass — проверка + очистка дублей ===
-if nft list table inet PodkopTable >/dev/null 2>&1; then
-    COUNT_100=$(nft list chain inet PodkopTable mangle_output 2>/dev/null | grep -c "100.64.0.0/10 accept")
-    COUNT_192=$(nft list chain inet PodkopTable mangle_output 2>/dev/null | grep -c "192.200.0.0/24 accept")
-
-    if [ "$COUNT_100" -gt 5 ] || [ "$COUNT_192" -gt 5 ]; then
-        # Слишком много дублей — почистить
-        nft flush chain inet PodkopTable mangle_output 2>/dev/null
-        # Восстановить оригинальные правила Podkop
-        /etc/init.d/podkop restart 2>/dev/null
-        sleep 2
-        # Вставить поверх наши bypass
-        nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
-        nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
-        logger -t ts-watchdog "PodkopTable очищен от дублей ($COUNT_100 + $COUNT_192 → 1+1)"
-    elif [ "$COUNT_100" -eq 0 ]; then
-        nft insert rule inet PodkopTable mangle_output ip daddr 100.64.0.0/10 accept 2>/dev/null
-        nft insert rule inet PodkopTable mangle_output ip daddr 192.200.0.0/24 accept 2>/dev/null
-        logger -t ts-watchdog "PodkopTable bypass rules INSERTED (были сброшены)"
+# Restore state backup if corrupted
+if [ -f /root/tailscaled.state.backup ]; then
+    CURR=$(wc -c < /etc/tailscale/tailscaled.state 2>/dev/null || echo 0)
+    if [ "$CURR" -lt 1000 ]; then
+        cp /root/tailscaled.state.backup /etc/tailscale/tailscaled.state
+        logger -t ts-watchdog "state restored from backup (was $CURR bytes)"
     fi
 fi
 
-# === tailscaled alive check ===
-if ! ps | grep -q "[t]ailscaled"; then
+# tailscaled alive check
+if ! pgrep tailscaled > /dev/null 2>&1; then
     logger -t ts-watchdog "tailscaled not running, restarting..."
     rm -f /var/run/tailscale/tailscaled.sock
     tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
-    sleep 3
-    tailscale up --accept-dns=false --accept-routes --netfilter-mode=off &
+    sleep 5
+    tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$HOSTNAME_VAL &
     logger -t ts-watchdog "tailscaled restarted"
     rm -f "$LOCKFILE"
     exit 0
 fi
 
-# === NoState check ===
+# NoState check
 TS_STATUS=$(tailscale status 2>&1)
 if echo "$TS_STATUS" | grep -q "NoState"; then
-    logger -t ts-watchdog "tailscaled in NoState, full restart..."
-    killall tailscale 2>/dev/null
-    sleep 1
-    killall tailscaled 2>/dev/null
-    sleep 2
+    logger -t ts-watchdog "NoState detected, full restart..."
+    killall tailscale 2>/dev/null; sleep 1
+    killall tailscaled 2>/dev/null; sleep 2
     rm -f /var/run/tailscale/tailscaled.sock
     tailscaled --statedir=/etc/tailscale/ --tun=userspace-networking >> /tmp/ts.log 2>&1 &
     sleep 5
-    tailscale up --accept-dns=false --accept-routes --netfilter-mode=off &
+    tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$HOSTNAME_VAL &
     logger -t ts-watchdog "tailscaled fully restarted (NoState fix)"
 fi
 
 rm -f "$LOCKFILE"
 WEOF
 chmod +x /etc/ts-watchdog.sh
+echo "  ✅ ts-watchdog v5.0 (pgrep, --hostname, state restore, lock)"
 
-# watchdog НЕ В CRON! Только в rc.local после tailscale up.
-# Иначе watchdog циклит: видит NoState → убивает tailscaled → перезапуск → снова NoState
-echo "  ✅ watchdog v4.2: только в rc.local (после tailscale up), не в cron"
+# 7. podkop-watchdog
+cat > /etc/podkop-watchdog.sh << 'EOF'
+#!/bin/sh
+if ! pgrep sing-box > /dev/null 2>&1; then
+    logger -t podkop-watchdog 'sing-box not running, restarting podkop'
+    /etc/init.d/podkop restart
+fi
+EOF
+chmod +x /etc/podkop-watchdog.sh
+echo "  ✅ podkop-watchdog создан"
 
-# 8. sync
-sync
+# 8. podkop-fix-lists (разблокировка GitHub CDN)
+cat > /etc/podkop-fix-lists.sh << 'EOF'
+#!/bin/sh
+for ip in 185.199.108.133 185.199.109.133; do
+    grep -q "$ip raw.githubusercontent.com" /etc/hosts 2>/dev/null || \
+        echo "$ip raw.githubusercontent.com" >> /etc/hosts
+done
+/usr/bin/podkop list_update 2>/dev/null || true
+EOF
+chmod +x /etc/podkop-fix-lists.sh
+echo "  ✅ podkop-fix-lists создан"
+
+# 9. Cron — 4 задачи
+(crontab -l 2>/dev/null \
+    | grep -v ts-watchdog \
+    | grep -v podkop-watchdog \
+    | grep -v podkop-fix-lists \
+    | grep -v "podkop list_update"
+echo "* * * * * /etc/ts-watchdog.sh"
+echo "*/2 * * * * /etc/podkop-watchdog.sh"
+echo "0 * * * * /etc/podkop-fix-lists.sh --cron"
+echo "13 */3 * * * /usr/bin/podkop list_update") | crontab -
+echo "  ✅ Cron: ts-watchdog(1m) + podkop-watchdog(2m) + fix-lists(1h) + list_update(3h)"
+
+# 10. podkop settings
+uci set podkop.settings.exclude_ntp='1' 2>/dev/null
+uci set podkop.settings.dns_server='1.1.1.1' 2>/dev/null
+uci commit podkop 2>/dev/null
+echo "  ✅ podkop: exclude_ntp=1, dns=1.1.1.1"
+
+# 11. Итоговая проверка
 echo ""
-echo "  ✅ Готово v4.3. Рекомендуется ребут."
+echo "═══════════════════════════════════════"
+echo "  ИТОГ:"
+echo "  hostname:   $HOSTNAME_VAL"
+echo "  ts version: $(tailscale version 2>/dev/null | head -1)"
+echo "  fw_mode:    $(uci get tailscale.settings.fw_mode 2>/dev/null)"
+echo "  autoupdate: $(uci get tailscale.settings.autoupdate 2>/dev/null)"
+echo "  init.d:     $(/etc/init.d/tailscale enabled 2>/dev/null && echo ENABLED || echo DISABLED)"
+echo "  rc.local:   $(grep -q tailscaled /etc/rc.local && echo OK || echo MISSING)"
+echo "  watchdogs:  $(crontab -l 2>/dev/null | grep -c watchdog)"
+echo "  state:      $(wc -c < /etc/tailscale/tailscaled.state 2>/dev/null || echo 0) байт"
+echo "  backup:     $(wc -c < /root/tailscaled.state.backup 2>/dev/null || echo 0) байт"
+echo "  exclude_ntp:$(uci get podkop.settings.exclude_ntp 2>/dev/null)"
+echo "═══════════════════════════════════════"
+echo ""
+if [ "$TS_VER" != "1.96.5" ]; then
+    echo "  ⚠️  ВНИМАНИЕ: бинарь $TS_VER — замени на 1.96.5 OPX перед ребутом!"
+    echo "     cat /tmp/tailscaled-196 | ssh root@192.168.5.1 'killall tailscaled; cat > /usr/sbin/tailscaled && chmod +x /usr/sbin/tailscaled'"
+    echo ""
+fi
+echo "  Готово v5.0. Перезагрузи: reboot"
 echo ""

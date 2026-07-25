@@ -2,7 +2,7 @@
 # OpenWrt Router Config Fix — Universal Rescue Script
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v6.0 — 2026-07-25
+# v6.1 — 2026-07-25
 #   Универсальный спасительный скрипт для роутеров с Podkop ИЛИ Forkop.
 #   БЕЗОПАСНЫЙ режим: никаких перезапусков сервисов!
 #   Можно запускать удалённо через SSH (в т.ч. через Tailscale) — соединение не рвётся.
@@ -37,7 +37,7 @@ HOSTNAME_VAL=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   OpenWrt Config Fix v6.0 — 2026-07-25              ║"
+echo "║   OpenWrt Config Fix v6.1 — 2026-07-25              ║"
 printf "║   Роутер: %-43s║\n" "$HOSTNAME_VAL"
 echo "║   Режим: БЕЗОПАСНЫЙ (без перезапусков)              ║"
 echo "╚══════════════════════════════════════════════════════╝"
@@ -165,11 +165,12 @@ fi
 # ── 5. rc.local ────────────────────────────────────────────────────────────
 cat > /etc/rc.local << RCEOF
 #!/bin/sh
-# rc.local v6.0 — 2026-07-25
-# NO --reset, NO --authkey, state restore из backup
+# rc.local v6.1 — 2026-07-25
+# touch /tmp/rc-local-running — watchdog не мешает rc.local
 # statedir: $TS_STATEDIR (определено автоматически)
 # VPN: $VPN_TYPE (автодетект)
 
+touch /tmp/rc-local-running
 /etc/init.d/tailscale disable 2>/dev/null
 
 if [ -f /root/tailscaled.state.backup ]; then
@@ -187,6 +188,7 @@ sleep 5
 tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$HOSTNAME_VAL &
 
 logger -t rc.local 'Tailscale started'
+rm -f /tmp/rc-local-running
 exit 0
 RCEOF
 chmod +x /etc/rc.local
@@ -195,7 +197,19 @@ echo "  ✅ rc.local: записан (statedir=$TS_STATEDIR, hostname=$HOSTNAME_
 # ── 6. ts-watchdog v6.0 ────────────────────────────────────────────────────
 cat > /etc/ts-watchdog.sh << 'WEOF'
 #!/bin/sh
-# ts-watchdog v6.0 — 2026-07-25
+# ts-watchdog v6.1 — 2026-07-25
+# Grace period: 180s uptime + rc-local-running flag
+
+# Grace period — не трогать первые 180 сек после загрузки
+UPTIME_SEC=$(cat /proc/uptime 2>/dev/null | awk '{print int($1)}')
+if [ "$UPTIME_SEC" -lt 180 ]; then
+  exit 0
+fi
+
+# rc.local ещё работает — не мешать
+if [ -f /tmp/rc-local-running ]; then
+  exit 0
+fi
 
 HOSTNAME_VAL=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 LOCKFILE=/tmp/ts-watchdog.lock

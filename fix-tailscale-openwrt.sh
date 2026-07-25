@@ -55,13 +55,17 @@ fi
 
 # ── 1. Tailscale бинарь — только проверка, не трогаем ──────────────────────
 TS_VER=$(tailscale version 2>/dev/null | head -1 | awk '{print $1}')
+TS_LONG=$(tailscale version 2>/dev/null | head -2 | tail -1)
 if [ "$TS_VER" = "1.96.5" ]; then
     echo "  ✅ tailscale: $TS_VER (OPX — правильная версия)"
+elif echo "$TS_LONG" | grep -q "OpenWrt-UPX"; then
+    echo "  ✅ tailscale: $TS_VER (GuNanOvO UPX — правильная версия)"
 elif [ -n "$TS_VER" ]; then
-    echo "  ⚠️  tailscale: $TS_VER (нужна 1.96.5 OPX — после ребута может быть серая точка)"
+    echo "  ⚠️  tailscale: $TS_VER (нужна 1.96.5 OPX или 1.98.9+ GuNanOvO UPX)"
     echo "     Замени бинарь с Мака (пока соединение живое):"
     echo "       scp /tmp/tailscaled-196 root@ROUTER_IP:/tmp/"
     echo "       ssh root@ROUTER_IP 'cp /tmp/tailscaled-196 /usr/sbin/tailscaled && chmod +x /usr/sbin/tailscaled'"
+    echo "     ИЛИ установи через apk: apk add --allow-untrusted tailscale"
     WARNINGS=$((WARNINGS + 1))
 else
     echo "  ⚠️  tailscale: не установлен"

@@ -198,11 +198,11 @@ echo "  ✅ rc.local: записан (statedir=$TS_STATEDIR, hostname=$HOSTNAME_
 cat > /etc/ts-watchdog.sh << 'WEOF'
 #!/bin/sh
 # ts-watchdog v6.1 — 2026-07-25
-# Grace period: 180s uptime + rc-local-running flag
+# Grace period: 90s uptime + rc-local-running flag
 
-# Grace period — не трогать первые 180 сек после загрузки
+# Grace period — не трогать первые 90 сек после загрузки
 UPTIME_SEC=$(cat /proc/uptime 2>/dev/null | awk '{print int($1)}')
-if [ "$UPTIME_SEC" -lt 180 ]; then
+if [ "$UPTIME_SEC" -lt 90 ]; then
   exit 0
 fi
 
@@ -471,11 +471,19 @@ uci set system.@system[0].cronloglevel='0' 2>/dev/null
 uci commit system 2>/dev/null
 echo "  ✅ логи: log_size=64, conloglevel=3, cronloglevel=0"
 
-# ── 9.7. Московское время ────────────────────────────────────────────────
+# ── 9.7. Московское время + NTP ───────────────────────────────────────
 uci set system.@system[0].timezone='MSK-3' 2>/dev/null
 uci set system.@system[0].zonename='Europe/Moscow' 2>/dev/null
+uci set system.ntp=timeserver 2>/dev/null
+uci delete system.ntp.server 2>/dev/null
+uci add_list system.ntp.server='0.openwrt.pool.ntp.org' 2>/dev/null
+uci add_list system.ntp.server='1.openwrt.pool.ntp.org' 2>/dev/null
+uci add_list system.ntp.server='2.openwrt.pool.ntp.org' 2>/dev/null
+uci add_list system.ntp.server='3.openwrt.pool.ntp.org' 2>/dev/null
+uci set system.ntp.enabled='1' 2>/dev/null
+uci set system.ntp.enable_server='0' 2>/dev/null
 uci commit system 2>/dev/null
-echo "  ✅ время: MSK-3, Europe/Moscow"
+echo "  ✅ время: MSK-3, Europe/Moscow + NTP servers"
 
 # ── 10. Итог ───────────────────────────────────────────────────────────────
 echo ""

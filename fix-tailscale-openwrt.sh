@@ -485,6 +485,18 @@ uci set system.ntp.enable_server='0' 2>/dev/null
 uci commit system 2>/dev/null
 echo "  ✅ время: MSK-3, Europe/Moscow + NTP servers"
 
+# ── 9.8. HTTPS→HTTP fix для apk (DPI режет HTTPS) ──────────────────────
+sed -i 's|https://|http://|g' /etc/apk/repositories.d/distfeeds.list 2>/dev/null
+sed -i 's|https://|http://|g' /etc/apk/repositories.d/customfeeds.list 2>/dev/null
+cat > /etc/uci-defaults/99-apk-http-fix << 'APKFIX'
+#!/bin/sh
+sed -i 's|https://|http://|g' /etc/apk/repositories.d/distfeeds.list 2>/dev/null
+sed -i 's|https://|http://|g' /etc/apk/repositories.d/customfeeds.list 2>/dev/null
+exit 0
+APKFIX
+chmod +x /etc/uci-defaults/99-apk-http-fix
+echo "  ✅ apk: HTTPS→HTTP (DPI fix + uci-defaults)"
+
 # ── 10. Итог ───────────────────────────────────────────────────────────────
 echo ""
 echo "═══════════════════════════════════════════"

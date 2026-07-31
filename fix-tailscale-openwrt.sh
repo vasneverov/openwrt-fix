@@ -2,7 +2,8 @@
 # OpenWrt Router Config Fix — Universal Rescue Script
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v6.1 — 2026-07-25
+# v6.2 — 2026-07-31
+#   - ts-watchdog v6.3 (offline netmap timeout fix) — мигающая серая точка
 #   Универсальный спасительный скрипт для роутеров с Podkop ИЛИ Forkop.
 #   БЕЗОПАСНЫЙ режим: никаких перезапусков сервисов!
 #   Можно запускать удалённо через SSH (в т.ч. через Tailscale) — соединение не рвётся.
@@ -18,7 +19,7 @@
 #   - UCI: exclude_ntp=1, dns_server (для podkop или forkop)
 #   - init.d/tailscale DISABLED (если существует — НЕ останавливает)
 #   - Пишет правильный rc.local (state restore, hostname, правильный statedir)
-#   - Пишет ts-watchdog v6.0 (pgrep, NoState fix, hostname, lock, statedir)
+#   - Пишет ts-watchdog v6.3 (offline netmap timeout fix, NoState, state restore, lock)
 #   - Создаёт VPN watchdog (podkop-watchdog.sh → /etc/init.d/podkop ИЛИ forkop)
 #   - Создаёт листовой скрипт (GitHub CDN разблокировка → podkop ИЛИ forkop list_update)
 #   - Создаёт hotplug: restart VPN при WAN up (30-podkop ИЛИ 30-forkop)
@@ -37,7 +38,7 @@ HOSTNAME_VAL=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   OpenWrt Config Fix v6.1 — 2026-07-25              ║"
+echo "║   OpenWrt Config Fix v6.2 — 2026-07-31              ║"
 printf "║   Роутер: %-43s║\n" "$HOSTNAME_VAL"
 echo "║   Режим: БЕЗОПАСНЫЙ (без перезапусков)              ║"
 echo "╚══════════════════════════════════════════════════════╝"
@@ -194,11 +195,14 @@ RCEOF
 chmod +x /etc/rc.local
 echo "  ✅ rc.local: записан (statedir=$TS_STATEDIR, hostname=$HOSTNAME_VAL, vpn=$VPN_TYPE)"
 
-# ── 6. ts-watchdog v6.0 ────────────────────────────────────────────────────
+# ── 6. ts-watchdog v6.3 ────────────────────────────────────────────────────
 cat > /etc/ts-watchdog.sh << 'WEOF'
 #!/bin/sh
-# ts-watchdog v6.1 — 2026-07-25
-# Grace period: 90s uptime + rc-local-running flag
+# ts-watchdog v6.3 — 2026-07-31
+# v6.3: перезапуск при offline (интернет есть) — netmap timeout fix.
+# Мигающая серая точка: long-poll к controlplane рвётся через sing-box → tailscale
+# показывает 'offline' при живом интернете. v6.3 это ловит и перезапускает.
+# + Grace period 90s uptime, rc-local-running флаг, state restore, lock.
 
 # Grace period — не трогать первые 90 сек после загрузки
 UPTIME_SEC=$(cat /proc/uptime 2>/dev/null | awk '{print int($1)}')
@@ -214,12 +218,23 @@ fi
 HOSTNAME_VAL=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 LOCKFILE=/tmp/ts-watchdog.lock
 TS_STATEDIR="__TS_STATEDIR__"
+RC_BACKUP="/etc/rc.local.bak"
 
 if [ -f "$LOCKFILE" ]; then
     LOCKPID=$(cat "$LOCKFILE" 2>/dev/null)
     if kill -0 "$LOCKPID" 2>/dev/null; then exit 0; fi
 fi
 echo $$ > "$LOCKFILE"
+
+# rc.local восстановление
+if [ ! -f "$RC_BACKUP" ]; then
+    logger -t ts-watchdog "rc.local.bak не найден!"
+    rm -f "$LOCKFILE"; exit 1
+fi
+if ! grep -q "tailscaled" /etc/rc.local 2>/dev/null; then
+    cp "$RC_BACKUP" /etc/rc.local
+    logger -t ts-watchdog "rc.local восстановлен"
+fi
 
 # Restore state if corrupted
 if [ -f /root/tailscaled.state.backup ]; then
@@ -230,34 +245,44 @@ if [ -f /root/tailscaled.state.backup ]; then
     fi
 fi
 
-# tailscaled alive check
-if ! pgrep tailscaled > /dev/null 2>&1; then
-    logger -t ts-watchdog "tailscaled not running, restarting..."
-    rm -f /var/run/tailscale/tailscaled.sock
-    tailscaled --statedir="$TS_STATEDIR" --tun=userspace-networking >> /tmp/ts.log 2>&1 &
-    sleep 5
-    tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$HOSTNAME_VAL &
-    logger -t ts-watchdog "tailscaled restarted"
-    rm -f "$LOCKFILE"; exit 0
-fi
-
-# NoState check
-if tailscale status 2>&1 | grep -q "NoState"; then
-    logger -t ts-watchdog "NoState, full restart..."
+restart_ts() {
+    logger -t ts-watchdog "$1"
     killall tailscale 2>/dev/null; sleep 1
     killall tailscaled 2>/dev/null; sleep 2
     rm -f /var/run/tailscale/tailscaled.sock
     tailscaled --statedir="$TS_STATEDIR" --tun=userspace-networking >> /tmp/ts.log 2>&1 &
     sleep 5
     tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$HOSTNAME_VAL &
-    logger -t ts-watchdog "tailscaled restarted (NoState fix)"
+    logger -t ts-watchdog "tailscaled restarted"
+}
+
+TS_STATUS=$(tailscale status 2>&1 | head -1)
+
+# 1. tailscaled alive check
+if ! pgrep tailscaled > /dev/null 2>&1; then
+    restart_ts "tailscaled not running, restarting..."
+    rm -f "$LOCKFILE"; exit 0
+fi
+
+# 2. NoState check
+if echo "$TS_STATUS" | grep -q "NoState"; then
+    restart_ts "NoState, full restart..."
+    rm -f "$LOCKFILE"; exit 0
+fi
+
+# 3. offline при живом интернете — netmap timeout (v6.3)
+if echo "$TS_STATUS" | grep -q "offline"; then
+    if ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
+        restart_ts "offline but internet OK (netmap timeout), restarting..."
+        rm -f "$LOCKFILE"; exit 0
+    fi
 fi
 
 rm -f "$LOCKFILE"
 WEOF
 sed -i "s|__TS_STATEDIR__|$TS_STATEDIR|g" /etc/ts-watchdog.sh
 chmod +x /etc/ts-watchdog.sh
-echo "  ✅ ts-watchdog: v6.0 записан (statedir=$TS_STATEDIR)"
+echo "  ✅ ts-watchdog: v6.3 записан (statedir=$TS_STATEDIR)"
 
 # ── 7. VPN watchdog (podkop ИЛИ forkop) ────────────────────────────────────
 # Файл называется podkop-watchdog.sh для совместимости со старыми установками

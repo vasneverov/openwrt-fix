@@ -2,7 +2,7 @@
 # OpenWrt Router Config Fix — Universal Rescue Script
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v6.2 — 2026-07-31
+# v6.3 — 2026-08-17
 #   - ts-watchdog v6.3 (offline netmap timeout fix) — мигающая серая точка
 #   Универсальный спасительный скрипт для роутеров с Podkop ИЛИ Forkop.
 #   БЕЗОПАСНЫЙ режим: никаких перезапусков сервисов!
@@ -38,7 +38,7 @@ HOSTNAME_VAL=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   OpenWrt Config Fix v6.2 — 2026-07-31              ║"
+echo "║   OpenWrt Config Fix v6.3 — 2026-08-17              ║"
 printf "║   Роутер: %-43s║\n" "$HOSTNAME_VAL"
 echo "║   Режим: БЕЗОПАСНЫЙ (без перезапусков)              ║"
 echo "╚══════════════════════════════════════════════════════╝"
@@ -522,6 +522,74 @@ APKFIX
 chmod +x /etc/uci-defaults/99-apk-http-fix
 echo "  ✅ apk: HTTPS→HTTP (DPI fix + uci-defaults)"
 
+# ── 9.9. GitHub raw зеркало (jsDelivr) + DNS DoH (Ростелеком и др.) ───────
+# Провайдер может резать raw.githubusercontent.com (429/000) → forkop не качает
+# subnet-списки → 'Failed to download telegram/meta subnet list' → Telegram/WhatsApp
+# не работают при рабочем YouTube. Также может резаться UDP 53 (DNS).
+# Зеркало jsDelivr (cdn.jsdelivr.net/gh/...) обходит raw-блокировку.
+# ВАЖНО: применяется ТОЛЬКО если raw недоступен и зеркало доступно. НЕ трогает
+# роутеры, где raw работает (Москва и др.) — там качается напрямую, это надёжнее.
+if [ -f /usr/bin/forkop ]; then
+    GITHUB_MIRROR_URL="https://cdn.jsdelivr.net/gh/itdoginfo/allow-domains@main"
+    GITHUB_RAW_TEST="https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/telegram.lst"
+    GITHUB_RAW_OK=""
+    GITHUB_MIRROR_OK=""
+
+    # Проверить доступность raw.githubusercontent (не режется ли)
+    if command -v curl >/dev/null 2>&1; then
+        code=$(curl -s -4 -o /dev/null -w '%{http_code}' --max-time 10 "$GITHUB_RAW_TEST" 2>/dev/null || echo 000)
+        if [ "$code" = "200" ]; then GITHUB_RAW_OK=1; fi
+    fi
+
+    if [ -n "$GITHUB_RAW_OK" ]; then
+        echo "  ✅ GitHub raw: доступен (200) — зеркало НЕ нужно, качаем напрямую"
+    else
+        echo "  ⚠️ GitHub raw: недоступен (код $code) — провайдер режет, проверяю зеркало jsDelivr..."
+        if command -v curl >/dev/null 2>&1; then
+            mcode=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$GITHUB_MIRROR_URL/Subnets/IPv4/telegram.lst" 2>/dev/null || echo 000)
+            if [ "$mcode" = "200" ]; then GITHUB_MIRROR_OK=1; fi
+        fi
+        if [ -n "$GITHUB_MIRROR_OK" ]; then
+            # Прописать зеркало в /etc/init.d/forkop
+            INITD_FORKOP=/etc/init.d/forkop
+            if grep -q 'GITHUB_RAW_URL' "$INITD_FORKOP" 2>/dev/null; then
+                echo "  ✅ GitHub зеркало: уже прописано в init.d/forkop"
+            else
+                cp "$INITD_FORKOP" "$INITD_FORKOP.bak-mirror" 2>/dev/null || true
+                sed -i "s|FORKOP_INITD_UC=.*|&\n\nexport GITHUB_RAW_URL=\"$GITHUB_MIRROR_URL\"|" "$INITD_FORKOP"
+                if ! grep -q 'GITHUB_RAW_URL="\$GITHUB_RAW_URL"' "$INITD_FORKOP"; then
+                    sed -i 's|        FORKOP_SERVICE_NAME="\$NAME" \\|        FORKOP_SERVICE_NAME="$NAME" \\\n        GITHUB_RAW_URL="$GITHUB_RAW_URL" \\|' "$INITD_FORKOP"
+                fi
+                if sh -n "$INITD_FORKOP" 2>/dev/null; then
+                    echo "  ✅ GitHub зеркало: jsDelivr ПРОПИСАНО в init.d/forkop (после ребута forkop списки пойдут через зеркало)"
+                else
+                    echo "  ❌ GitHub зеркало: ошибка синтаксиса — ОТКАТ бэкапа"
+                    cp "$INITD_FORKOP.bak-mirror" "$INITD_FORKOP" 2>/dev/null || true
+                fi
+            fi
+        else
+            echo "  ❌ GitHub зеркало: jsDelivr тоже недоступен ($mcode) — нужно ручное вмешательство"
+        fi
+    fi
+
+    # DNS через DoH, если UDP 53 режется
+    if command -v nslookup >/dev/null 2>&1; then
+        dns_udp_ok=$(nslookup example.com 8.8.8.8 2>&1 | grep -cE 'Address' || true)
+        if [ "$dns_udp_ok" -lt 1 ]; then
+            cur_dns=$(uci get forkop.settings.dns_type 2>/dev/null || echo "")
+            if [ "$cur_dns" != "doh" ]; then
+                uci set forkop.settings.dns_type='doh'
+                uci commit forkop
+                echo "  ✅ DNS DoH: UDP 53 режется — dns_type переключён на 'doh' (было '$cur_dns')"
+            else
+                echo "  ✅ DNS DoH: уже 'doh'"
+            fi
+        else
+            echo "  ✅ DNS: UDP 53 работает — DoH не нужен"
+        fi
+    fi
+fi
+
 # ── 10. Итог ───────────────────────────────────────────────────────────────
 echo ""
 echo "═══════════════════════════════════════════"
@@ -539,6 +607,7 @@ echo "  rc.local.bak: $(ls /etc/rc.local.bak >/dev/null 2>&1 && echo OK || echo 
 echo "  ts-watchdog: $(crontab -l 2>/dev/null | grep -c ts-watchdog) cron"
 echo "  vpn-watchdog:$(crontab -l 2>/dev/null | grep -c podkop-watchdog) cron"
 echo "  fix-lists:   $(crontab -l 2>/dev/null | grep -c podkop-fix-lists) cron"
+echo "  gh-mirror:   $(grep -q GITHUB_RAW_URL /etc/init.d/forkop 2>/dev/null && echo OK || echo NONE)"
 echo "  hotplug WAN: $(ls /etc/hotplug.d/iface/30-vpn >/dev/null 2>&1 && echo OK || echo MISSING)"
 echo "  hotplug TS:  $(ls /etc/hotplug.d/net/99-vpn-tailscale >/dev/null 2>&1 && echo OK || echo MISSING)"
 echo "  crond:       $(pgrep crond >/dev/null 2>&1 && echo running || echo NOT running)"

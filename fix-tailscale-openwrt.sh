@@ -2,7 +2,16 @@
 # OpenWrt Router Config Fix — Universal Rescue Script
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v6.3 — 2026-08-17
+# v6.4 — 2026-08-24
+#   - fix-lists: ВСЕ GitHub-домены в hosts (github.com + api + codeload + 4×raw +
+#     objects + release-assets + github-releases + githubassets + avatars).
+#     Старой версии (только raw.githubusercontent.com) НЕДОСТАТОЧНО: .srs списки
+#     forkop качает с github.com/.../releases/latest/download/ → 302-редирект на CDN.
+#     Если CDN-домены не в hosts → файл 0 байт → /tmp/sing-box/rulesets пуст →
+#     set forkop_subnets (fakeip) пуст → tproxy не маркирует клиентский трафик →
+#     VPN для клиентов мёртв (а curl с роутера ОБХОДИТ tproxy и «YouTube 200» ложно!).
+#   - update_interval='1h' (обновление списков каждый час, не 1 день)
+#   - fix-lists самозапускается: если rulesets пуст → скачивает списки
 #   - ts-watchdog v6.3 (offline netmap timeout fix) — мигающая серая точка
 #   Универсальный спасительный скрипт для роутеров с Podkop ИЛИ Forkop.
 #   БЕЗОПАСНЫЙ режим: никаких перезапусков сервисов!
@@ -151,8 +160,9 @@ fi
 if [ "$VPN_TYPE" != "none" ]; then
     uci set ${VPN_CONFIG}.settings.exclude_ntp='1' 2>/dev/null
     uci set ${VPN_CONFIG}.settings.dns_server='1.1.1.1' 2>/dev/null
+    uci set ${VPN_CONFIG}.settings.update_interval='1h' 2>/dev/null
     uci commit ${VPN_CONFIG} 2>/dev/null
-    echo "  ✅ ${VPN_TYPE} UCI: exclude_ntp=1, dns=1.1.1.1"
+    echo "  ✅ ${VPN_TYPE} UCI: exclude_ntp=1, dns=1.1.1.1, update_interval=1h"
 fi
 
 # ── 4. init.d DISABLED (не останавливает, только убирает автостарт) ────────
@@ -344,15 +354,26 @@ fi
 if [ ! -f /etc/podkop-fix-lists.sh ]; then
     cat > /etc/podkop-fix-lists.sh << EOF
 #!/bin/sh
-# Листовой скрипт — разблокировка GitHub CDN для ${VPN_TYPE} list_update
-for ip in 185.199.108.133 185.199.109.133 185.199.110.133 185.199.111.133; do
-    grep -q "\$ip raw.githubusercontent.com" /etc/hosts 2>/dev/null || \\
-        echo "\$ip raw.githubusercontent.com" >> /etc/hosts
-done
-${VPN_LIST_BIN} list_update 2>/dev/null || true
+# Листовой скрипт — разблокировка ВЕСЬ GitHub CDN для ${VPN_TYPE} list_update
+H=/etc/hosts
+add() { grep -q "\$2 \$1" \$H 2>/dev/null || echo "\$2 \$1" >> \$H; }
+add github.com 140.82.121.4
+add api.github.com 140.82.121.6
+add codeload.github.com 140.82.121.10
+add raw.githubusercontent.com 185.199.108.133
+add raw.githubusercontent.com 185.199.109.133
+add raw.githubusercontent.com 185.199.110.133
+add raw.githubusercontent.com 185.199.111.133
+add objects.githubusercontent.com 185.199.108.133
+add release-assets.githubusercontent.com 185.199.109.133
+add github-releases.githubusercontent.com 185.199.109.154
+add github.githubassets.com 185.199.108.215
+add avatars.githubusercontent.com 185.199.110.133
+# самозапуск: если rulesets пуст → скачать списки
+[ "\$(ls /tmp/sing-box/rulesets/*.srs 2>/dev/null | wc -l)" -eq 0 ] && ${VPN_LIST_BIN} list_update 2>/dev/null || true
 EOF
     chmod +x /etc/podkop-fix-lists.sh
-    echo "  ✅ листовой скрипт: создан (${VPN_TYPE} → ${VPN_LIST_BIN})"
+    echo "  ✅ листовой скрипт: создан (${VPN_TYPE} → ${VPN_LIST_BIN}, ВСЕ GitHub-домены)"
 else
     # Проверить что скрипт ссылается на правильный бинарь
     if grep -q "$VPN_LIST_BIN" /etc/podkop-fix-lists.sh 2>/dev/null; then
@@ -360,15 +381,26 @@ else
     else
         cat > /etc/podkop-fix-lists.sh << EOF
 #!/bin/sh
-# Листовой скрипт — разблокировка GitHub CDN для ${VPN_TYPE} list_update
-for ip in 185.199.108.133 185.199.109.133 185.199.110.133 185.199.111.133; do
-    grep -q "\$ip raw.githubusercontent.com" /etc/hosts 2>/dev/null || \\
-        echo "\$ip raw.githubusercontent.com" >> /etc/hosts
-done
-${VPN_LIST_BIN} list_update 2>/dev/null || true
+# Листовой скрипт — разблокировка ВЕСЬ GitHub CDN для ${VPN_TYPE} list_update
+H=/etc/hosts
+add() { grep -q "\$2 \$1" \$H 2>/dev/null || echo "\$2 \$1" >> \$H; }
+add github.com 140.82.121.4
+add api.github.com 140.82.121.6
+add codeload.github.com 140.82.121.10
+add raw.githubusercontent.com 185.199.108.133
+add raw.githubusercontent.com 185.199.109.133
+add raw.githubusercontent.com 185.199.110.133
+add raw.githubusercontent.com 185.199.111.133
+add objects.githubusercontent.com 185.199.108.133
+add release-assets.githubusercontent.com 185.199.109.133
+add github-releases.githubusercontent.com 185.199.109.154
+add github.githubassets.com 185.199.108.215
+add avatars.githubusercontent.com 185.199.110.133
+# самозапуск: если rulesets пуст → скачать списки
+[ "\$(ls /tmp/sing-box/rulesets/*.srs 2>/dev/null | wc -l)" -eq 0 ] && ${VPN_LIST_BIN} list_update 2>/dev/null || true
 EOF
         chmod +x /etc/podkop-fix-lists.sh
-        echo "  ✅ листовой скрипт: переписан (${VPN_TYPE} → ${VPN_LIST_BIN})"
+        echo "  ✅ листовой скрипт: переписан (${VPN_TYPE} → ${VPN_LIST_BIN}, ВСЕ GitHub-домены)"
     fi
 fi
 

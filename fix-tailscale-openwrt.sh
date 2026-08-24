@@ -355,8 +355,15 @@ if [ ! -f /etc/podkop-fix-lists.sh ]; then
     cat > /etc/podkop-fix-lists.sh << EOF
 #!/bin/sh
 # Листовой скрипт — разблокировка ВЕСЬ GitHub CDN для ${VPN_TYPE} list_update
+QUIET=0
+[ "\$1" = "--cron" ] && QUIET=1
+add() {
+    if ! grep -q "\$2 \$1" \$H 2>/dev/null; then
+        echo "\$2 \$1" >> \$H
+        [ "\$QUIET" = "0" ] && echo "  + hosts: \$1 → \$2"
+    fi
+}
 H=/etc/hosts
-add() { grep -q "\$2 \$1" \$H 2>/dev/null || echo "\$2 \$1" >> \$H; }
 add github.com 140.82.121.4
 add api.github.com 140.82.121.6
 add codeload.github.com 140.82.121.10
@@ -370,7 +377,14 @@ add github-releases.githubusercontent.com 185.199.109.154
 add github.githubassets.com 185.199.108.215
 add avatars.githubusercontent.com 185.199.110.133
 # самозапуск: если rulesets пуст → скачать списки
-[ "\$(ls /tmp/sing-box/rulesets/*.srs 2>/dev/null | wc -l)" -eq 0 ] && ${VPN_LIST_BIN} list_update 2>/dev/null || true
+SRC=\$(ls /tmp/sing-box/rulesets/*.srs 2>/dev/null | wc -l)
+if [ "\$SRC" -eq 0 ]; then
+    [ "\$QUIET" = "0" ] && echo "  ℹ️ rulesets пуст (\$SRC) — скачиваю списки..."
+    ${VPN_LIST_BIN} list_update 2>/dev/null || true
+    [ "\$QUIET" = "0" ] && echo "  ✅ списки обновлены: \$(ls /tmp/sing-box/rulesets/*.srs 2>/dev/null | wc -l) srs"
+else
+    [ "\$QUIET" = "0" ] && echo "  ✅ rulesets на месте (\$SRC srs) — не трогаю"
+fi
 EOF
     chmod +x /etc/podkop-fix-lists.sh
     echo "  ✅ листовой скрипт: создан (${VPN_TYPE} → ${VPN_LIST_BIN}, ВСЕ GitHub-домены)"
@@ -382,8 +396,15 @@ else
         cat > /etc/podkop-fix-lists.sh << EOF
 #!/bin/sh
 # Листовой скрипт — разблокировка ВЕСЬ GitHub CDN для ${VPN_TYPE} list_update
+QUIET=0
+[ "\$1" = "--cron" ] && QUIET=1
+add() {
+    if ! grep -q "\$2 \$1" \$H 2>/dev/null; then
+        echo "\$2 \$1" >> \$H
+        [ "\$QUIET" = "0" ] && echo "  + hosts: \$1 → \$2"
+    fi
+}
 H=/etc/hosts
-add() { grep -q "\$2 \$1" \$H 2>/dev/null || echo "\$2 \$1" >> \$H; }
 add github.com 140.82.121.4
 add api.github.com 140.82.121.6
 add codeload.github.com 140.82.121.10
@@ -397,7 +418,14 @@ add github-releases.githubusercontent.com 185.199.109.154
 add github.githubassets.com 185.199.108.215
 add avatars.githubusercontent.com 185.199.110.133
 # самозапуск: если rulesets пуст → скачать списки
-[ "\$(ls /tmp/sing-box/rulesets/*.srs 2>/dev/null | wc -l)" -eq 0 ] && ${VPN_LIST_BIN} list_update 2>/dev/null || true
+SRC=\$(ls /tmp/sing-box/rulesets/*.srs 2>/dev/null | wc -l)
+if [ "\$SRC" -eq 0 ]; then
+    [ "\$QUIET" = "0" ] && echo "  ℹ️ rulesets пуст (\$SRC) — скачиваю списки..."
+    ${VPN_LIST_BIN} list_update 2>/dev/null || true
+    [ "\$QUIET" = "0" ] && echo "  ✅ списки обновлены: \$(ls /tmp/sing-box/rulesets/*.srs 2>/dev/null | wc -l) srs"
+else
+    [ "\$QUIET" = "0" ] && echo "  ✅ rulesets на месте (\$SRC srs) — не трогаю"
+fi
 EOF
         chmod +x /etc/podkop-fix-lists.sh
         echo "  ✅ листовой скрипт: переписан (${VPN_TYPE} → ${VPN_LIST_BIN}, ВСЕ GitHub-домены)"
@@ -646,6 +674,8 @@ echo "  crond:       $(pgrep crond >/dev/null 2>&1 && echo running || echo NOT r
 echo "  state:       $(wc -c < "${TS_STATEDIR}tailscaled.state" 2>/dev/null || echo 0) байт"
 echo "  backup:      $(wc -c < /root/tailscaled.state.backup 2>/dev/null || echo 0) байт"
 echo "  exclude_ntp: $(uci get ${VPN_CONFIG}.settings.exclude_ntp 2>/dev/null || echo 'N/A')"
+echo "  list_update:  $(uci get ${VPN_CONFIG}.settings.update_interval 2>/dev/null || echo 'N/A')"
+echo "  rulesets:     $(ls /tmp/sing-box/rulesets/*.srs 2>/dev/null | wc -l | tr -d ' ') srs (fakeip_subnets должен быть НЕ пуст)"
 echo "  sing-box:    $(pgrep sing-box >/dev/null 2>&1 && echo running || echo NOT running)"
 echo "═══════════════════════════════════════════"
 echo ""

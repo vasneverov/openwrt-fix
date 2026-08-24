@@ -2,7 +2,12 @@
 # OpenWrt Router Config Fix — Universal Rescue Script
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v6.4 — 2026-08-24
+# v6.5 — 2026-08-24
+#   - НОВОЕ (секция 8.4): диагностика/фикс мёртвого dhcp_option. Если клиентам раздаётся
+#     fakeip-DNS (dhcp_option=6,198.18.0.2) — на этом IP НИКТО не слушает (sing-box на
+#     127.0.0.42, dnsmasq на <lan_ip>) → DNS клиентов мёртв → «ни один сайт не открывается»,
+#     а Telegram работает (у него свои IP). Скрипт находит и удаляет → клиенты идут через
+#     роутер. ГЛАВНЫЙ корень проблемы 49-puzikov (24.08.2026).
 #   - fix-lists: ВСЕ GitHub-домены в hosts (github.com + api + codeload + 4×raw +
 #     objects + release-assets + github-releases + githubassets + avatars).
 #     Старой версии (только raw.githubusercontent.com) НЕДОСТАТОЧНО: .srs списки
@@ -430,6 +435,24 @@ EOF
         chmod +x /etc/podkop-fix-lists.sh
         echo "  ✅ листовой скрипт: переписан (${VPN_TYPE} → ${VPN_LIST_BIN}, ВСЕ GitHub-домены)"
     fi
+fi
+
+# ── 8.4. Мёртвый dhcp_option (fakeip-DNS клиентам) — ГЛАВНЫЙ корень «ничего не открывается» ─
+# 24.08.2026 (49-puzikov): dhcp_option='6,198.18.0.2' раздавал клиентам DNS 198.18.0.2,
+# на котором НИКТО не слушает (sing-box на 127.0.0.42, dnsmasq на <lan_ip>) → DNS клиентов
+# мёртв → «ни один сайт не открывается», Telegram работает. Норма: dhcp_option ОТСУТСТВУЕТ
+# (эталон TR-Boss-00, клиенты идут через роутер → dnsmasq → sing-box).
+DHCP_OPT="$(uci get dhcp.lan.dhcp_option 2>/dev/null)"
+if [ -n "$DHCP_OPT" ] && echo "$DHCP_OPT" | grep -qE '198\.18\.|fakeip'; then
+    echo "  ⚠️ dhcp_option раздаёт fakeip-DNS ($DHCP_OPT) — на этом IP никто не слушает, DNS клиентов мёртв!"
+    uci -q delete dhcp.lan.dhcp_option
+    uci commit dhcp
+    echo "  ✅ dhcp_option удалён — клиенты получат DNS роутера (dnsmasq → sing-box)"
+    /etc/init.d/dnsmasq restart 2>/dev/null
+elif [ -n "$DHCP_OPT" ]; then
+    echo "  ℹ️ dhcp_option: $DHCP_OPT (не fakeip — оставляю)"
+else
+    echo "  ✅ dhcp_option отсутствует — клиенты идут через роутер (правильно)"
 fi
 
 # ── 8.5. Hotplug: restart VPN при WAN up ─────────────────────────────────

@@ -2,7 +2,11 @@
 # OpenWrt Router Config Fix — Universal Rescue Script
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v6.5 — 2026-08-24
+# v6.6 — 2026-08-27
+#   - НОВОЕ (секция 8.4a): REBIND-ФИКС — dnsmasq rebind-защита режет fakeip-ответы
+#     sing-box (198.18.x) → «только WhatsApp/Telegram не работает у части клиентов»
+#     (logread: possible DNS-rebind attack detected: web.whatsapp.com). Скрипт ставит
+#     rebind_protection=0 + rebind_localhost=0 (урок x46-04/tr56-14, 27.08.2026).
 #   - НОВОЕ (секция 8.4): диагностика/фикс мёртвого dhcp_option. Если клиентам раздаётся
 #     fakeip-DNS (dhcp_option=6,198.18.0.2) — на этом IP НИКТО не слушает (sing-box на
 #     127.0.0.42, dnsmasq на <lan_ip>) → DNS клиентов мёртв → «ни один сайт не открывается»,
@@ -52,7 +56,7 @@ HOSTNAME_VAL=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   OpenWrt Config Fix v6.3 — 2026-08-17              ║"
+echo "║   OpenWrt Config Fix v6.6 — 2026-08-27              ║"
 printf "║   Роутер: %-43s║\n" "$HOSTNAME_VAL"
 echo "║   Режим: БЕЗОПАСНЫЙ (без перезапусков)              ║"
 echo "╚══════════════════════════════════════════════════════╝"
@@ -453,6 +457,28 @@ elif [ -n "$DHCP_OPT" ]; then
     echo "  ℹ️ dhcp_option: $DHCP_OPT (не fakeip — оставляю)"
 else
     echo "  ✅ dhcp_option отсутствует — клиенты идут через роутер (правильно)"
+fi
+
+# ── 8.4a. REBIND-ФИКС: dnsmasq rebind-защита режет fakeip (198.18.x) ────────
+# 27.08.2026 (x46-04, tr56-14): dnsmasq с rebind_protection=1 + rebind_localhost=1
+# считает fakeip-ответы sing-box (198.18.x) rebind-атакой и РЕЖЕТ их →
+# «только WhatsApp/Telegram не работает у части клиентов, у остальных работает»
+# (logread: possible DNS-rebind attack detected: web.whatsapp.com каждые ~90с).
+# Лечение: выключить защиту — это БЕЗОПАСНО (роутер за NAT, клиенты локальные).
+# Норма эталона: rebind_protection=0, rebind_localhost=0.
+REBIND_P=$(uci get dhcp.@dnsmasq[0].rebind_protection 2>/dev/null)
+REBIND_L=$(uci get dhcp.@dnsmasq[0].rebind_localhost 2>/dev/null)
+if [ "$REBIND_P" = "1" ] || [ "$REBIND_L" = "1" ]; then
+    uci set dhcp.@dnsmasq[0].rebind_protection='0'
+    uci set dhcp.@dnsmasq[0].rebind_localhost='0'
+    uci commit dhcp
+    echo "  ⚠️ rebind-защита была ВКЛЮЧЕНА (protection=$REBIND_P, localhost=$REBIND_L) — резала fakeip WhatsApp/Telegram!"
+    echo "  ✅ rebind_protection=0 + rebind_localhost=0 — защита выключена, fakeip работает"
+    /etc/init.d/dnsmasq restart 2>/dev/null
+elif [ "$REBIND_P" = "0" ] && [ "$REBIND_L" = "0" ]; then
+    echo "  ✅ rebind: protection=0, localhost=0 (fakeip не режется — правильно)"
+else
+    echo "  ℹ️  rebind: protection='$REBIND_P', localhost='$REBIND_L' — проверьте"
 fi
 
 # ── 8.5. Hotplug: restart VPN при WAN up ─────────────────────────────────

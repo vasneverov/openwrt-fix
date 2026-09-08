@@ -56,7 +56,7 @@ HOSTNAME_VAL=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   OpenWrt Config Fix v6.6 — 2026-08-27              ║"
+echo "║   OpenWrt Config Fix v6.7 — 2026-09-07              ║"
 printf "║   Роутер: %-43s║\n" "$HOSTNAME_VAL"
 echo "║   Режим: БЕЗОПАСНЫЙ (без перезапусков)              ║"
 echo "╚══════════════════════════════════════════════════════╝"
@@ -172,6 +172,86 @@ if [ "$VPN_TYPE" != "none" ]; then
     uci set ${VPN_CONFIG}.settings.update_interval='1h' 2>/dev/null
     uci commit ${VPN_CONFIG} 2>/dev/null
     echo "  ✅ ${VPN_TYPE} UCI: exclude_ntp=1, dns=1.1.1.1, update_interval=1h"
+fi
+
+# ── 3.6. ЭТАЛОН ФОРКОПА (07.09.2026) — вдохнуть жизнь в сервисы на старом роутере ──
+# Дополняет базовый фикс наработками 29.08-07.09, без которых форкоп выглядит
+# «всё 000 / не работает» даже при живом sing-box (уроки 66-smazilkina, tr30_22, S78-42):
+#   - urltest «Самый лучший» + sort_by_latency=1 (галочка «сортировать по задержке»)
+#     → форкоп выбирает лучший узел. БЕЗ НИХ «Самый лучший» не работает → «всё 000»,
+#     а я ошибочно винил провайдера (корень был в неполном эталоне).
+#   - badwan = мониторинг WAN-интерфейса (наработка 06.09) — перезапуск при флапе WAN.
+#   - meta ПЕРВЫМ в community_lists (правило 29.08) — иначе Meta/WhatsApp падают.
+#   - domain = WhatsApp+IG (если пусто/мусор expedia) — WhatsApp-улучшители.
+#   - resolve_real_ip_for_routing=0.
+#   - число подписок (эталон 2-3: pl6+play2nl5+pl3ip) — если 1, добавить (урок tr30_22).
+if [ "$VPN_TYPE" = "forkop" ]; then
+    echo "  ── Эталон форкопа (07.09) ──"
+    # 1) urltest «Самый лучший» (если нет ни «Самый лучший», ни «Лучший»)
+    URTEST_NAME=$(uci get forkop.@urltest[0].name 2>/dev/null)
+    if [ "$URTEST_NAME" != "Самый лучший" ] && [ "$URTEST_NAME" != "Лучший" ]; then
+        uci add forkop urltest
+        uci set forkop.@urltest[-1].section='main'
+        uci set forkop.@urltest[-1].name='Самый лучший'
+        uci set forkop.@urltest[-1].check_interval='30s'
+        uci set forkop.@urltest[-1].tolerance='100'
+        uci set forkop.@urltest[-1].testing_url='https://captive.apple.com'
+        uci set forkop.@urltest[-1].idle_timeout='30m'
+        uci set forkop.@urltest[-1].interrupt_exist_connections='0'
+        uci set forkop.@urltest[-1].pin_dashboard='1'
+        uci set forkop.@urltest[-1].filter_mode='disabled'
+        echo "  ✅ urltest «Самый лучший»: создан"
+    else
+        echo "  ✅ urltest «Самый лучший»: уже есть ($URTEST_NAME)"
+    fi
+    # 2) sort_by_latency=1 (галочка «сортировать по задержке»)
+    uci set forkop.main.sort_by_latency='1'
+    echo "  ✅ sort_by_latency=1 (галочка «сортировать по задержке»)"
+    # 3) badwan — мониторинг WAN-интерфейса (наработка 06.09)
+    uci set forkop.settings.enable_badwan_interface_monitoring='1'
+    uci -q delete forkop.settings.badwan_monitored_interfaces
+    uci add_list forkop.settings.badwan_monitored_interfaces='wan'
+    echo "  ✅ badwan: мониторинг WAN-интерфейса включён (wan)"
+    # 4) resolve_real_ip_for_routing=0
+    uci set forkop.settings.resolve_real_ip_for_routing='0'
+    echo "  ✅ resolve_real_ip_for_routing=0"
+    # 5) meta ПЕРВЫМ в community_lists (правило 29.08)
+    FIRST=$(uci get forkop.main.community_lists 2>/dev/null | awk '{print $1}')
+    if [ "$FIRST" != "meta" ]; then
+        echo "  ⚠️ meta НЕ первый (был '$FIRST') — перестраиваю список с meta первым"
+        uci -q delete forkop.main.community_lists
+        for l in meta geoblock block telegram youtube discord porn news anime twitter hdrezka tiktok cloudflare google_ai google_play hodca roblox supercell github hetzner ovh digitalocean cloudfront; do
+            uci add_list forkop.main.community_lists=$l
+        done
+        echo "  ✅ meta первый, списки перестроены (23)"
+    else
+        echo "  ✅ meta первый (правильно)"
+    fi
+    # 6) domain = WhatsApp+IG (если пусто/нет whatsapp; клиентские домены сохраняются)
+    DOM=$(uci get forkop.main.domain 2>/dev/null)
+    if ! echo "$DOM" | grep -q whatsapp; then
+        uci set forkop.main.domain='whatsapp.com whatsapp.net whatsapp.org wa.me instagram.com cdninstagram.com fbcdn.net'
+        echo "  ✅ domain: WhatsApp+IG установлены (был: '${DOM:-пусто}')"
+    else
+        echo "  ✅ domain: WhatsApp есть (сохранён, клиентские домены не тронуты)"
+    fi
+    # 7) число подписок (эталон 2-3: pl6+play2nl5+pl3ip)
+    SUBCOUNT=$(uci show forkop 2>/dev/null | grep -c '\.url=')
+    if [ "$SUBCOUNT" -lt 2 ]; then
+        echo "  ⚠️ подписок $SUBCOUNT (эталон 2-3) — мало узлов, добавь pl6+play2nl5 (см. скилл)"
+    else
+        echo "  ✅ подписок: $SUBCOUNT"
+    fi
+    uci commit forkop 2>/dev/null
+fi
+
+# ── 3.7. AutoUpdate tailscale OFF (Check:false + update-check) ──────────────
+AUC=$(tailscale debug prefs 2>/dev/null | grep -A2 AutoUpdate | grep Check | tr -d ' \t"' 2>/dev/null)
+if [ "$AUC" != "false" ]; then
+    tailscale set --auto-update=false --update-check=false 2>/dev/null
+    echo "  ✅ tailscale AutoUpdate: выключен (Check:false)"
+else
+    echo "  ✅ tailscale AutoUpdate: Check:false (уже)"
 fi
 
 # ── 4. init.d DISABLED (не останавливает, только убирает автостарт) ────────

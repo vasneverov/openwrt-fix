@@ -2,7 +2,7 @@
 # OpenWrt Router Config Fix — Universal Rescue Script
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v7.1 — 2026-10-03  «ЭТАЛОН 03.10» + ЩИТ TAILSCALE (всё, что накоплено с 07.09 по 03.10.2026)
+# v7.2 — 2026-10-03  «ЭТАЛОН 03.10» + ЩИТ TAILSCALE (всё, что накоплено с 07.09 по 03.10.2026)
 #   Принцип: файлы эталона ставятся ТОЛЬКО если установленная версия СТАРШЕ (новее/равное не трогаем,
 #   бэкап заменённого — /root/rescue-v7-<дата>/). Без перезапусков сервисов и без ребута.
 #   Для вступления форкоп-правок в силу: RESTART=1 sh <(wget ...)  → ОДИН forkop restart в конце.
@@ -35,7 +35,7 @@ HOSTNAME_VAL=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   OpenWrt Config Fix v7.1 — 2026-10-03              ║"
+echo "║   OpenWrt Config Fix v7.2 — 2026-10-03              ║"
 printf "║   Роутер: %-43s║\n" "$HOSTNAME_VAL"
 echo "║   Режим: БЕЗОПАСНЫЙ (без перезапусков)              ║"
 echo "╚══════════════════════════════════════════════════════╝"
@@ -234,10 +234,11 @@ else
     echo "  ✅ tailscale AutoUpdate: Check:false (уже)"
 fi
 
-# ── 4. init.d DISABLED (не останавливает, только убирает автостарт) ────────
+# ── 4. init.d/tailscale: НЕ отключаем здесь (v7.2, железное №1) ───────────────────────────
+#   Автозапуск init.d снимается ТОЛЬКО в 5.1 и ТОЛЬКО если в rc.local есть настоящая строка запуска tailscaled
+#   (иначе после перезагрузки Tailscale не поднимется). Ребут-тест на удалённых запрещён — способ запуска не меняем вслепую.
 if [ -f /etc/init.d/tailscale ]; then
-    /etc/init.d/tailscale disable 2>/dev/null
-    echo "  ✅ init.d/tailscale: DISABLED (текущий процесс не тронут)"
+    echo "  ℹ️  init.d/tailscale: $(/etc/init.d/tailscale enabled 2>/dev/null && echo 'enabled' || echo 'disabled') (решение — в 5.1)"
 else
     echo "  ℹ️  init.d/tailscale: не найден (tailscale управляется через rc.local)"
 fi
@@ -267,8 +268,9 @@ snapshot() { # $1 = метка
 ' | grep -cE 'anthropic|claude|openai|chatgpt|sora')" = 0 ] && echo 1 || echo 0)) ИИ-доменов в main нет   $(mk $(grep -q 'guard.sh v3' /etc/forkop-domain-guard.sh 2>/dev/null && echo 1 || echo 0)) сторож доменов v3   $(mk $(grep -q 'boot grace' /etc/forkop-watchdog.sh 2>/dev/null && echo 1 || echo 0)) сторож форкопа v2.1"
     fi
     echo "  │ $(mk $(grep -q 'ts-watchdog v6.6' /etc/ts-watchdog.sh 2>/dev/null && echo 1 || echo 0)) ts-watchdog v6.6   $(mk $(grep -q uptime /etc/hotplug.d/iface/30-vpn 2>/dev/null && echo 1 || echo 0)) hotplug 30-vpn v2   $(mk $([ "$(ls /etc/hotplug.d/iface 2>/dev/null | grep -c '^30-')" = 1 ] && echo 1 || echo 0)) один hotplug 30-*   $(mk $(grep -q zram /proc/swaps 2>/dev/null && echo 1 || echo 0)) zram"
-    echo "  │ $(mk $(grep -q userspace-networking /etc/rc.local 2>/dev/null && echo 1 || echo 0)) rc.local: userspace   $(mk $(grep -q oom_score_adj /etc/rc.local 2>/dev/null && echo 1 || echo 0)) oom -900   $(mk $(grep -q 'auto-update=false' /etc/rc.local 2>/dev/null && echo 1 || echo 0)) autoupdate off   $(mk $(tailscale debug prefs 2>/dev/null | grep -A2 AutoUpdate | tr -d ' 	
-' | grep -q '"Check":false' && echo 1 || echo 0)) TS autoupdate выключен"
+    _RS=$(grep -v '^[[:space:]]*#' /etc/rc.local 2>/dev/null | grep -cE 'tailscaled[[:space:]].*--(state|statedir|tun)|init\.d/tailscale[[:space:]]+(start|restart)'); _IE=0; /etc/init.d/tailscale enabled 2>/dev/null && _IE=1
+    if [ "$_RS" = "0" ]; then echo "  │ запуск Tailscale: в rc.local строки нет · init.d enabled: $(mk $_IE) $([ "$_IE" = 1 ] && echo '(запуск через init.d — норма, способ не меняем)' || echo '(НИКТО не запускает при загрузке — см. 5.1)')   $(mk $(tailscale debug prefs 2>/dev/null | grep -A2 AutoUpdate | tr -d ' \t\n' | grep -q '"Check":false' && echo 1 || echo 0)) TS autoupdate выключен"
+    else echo "  │ $(mk $(grep -q userspace-networking /etc/rc.local 2>/dev/null && echo 1 || echo 0)) rc.local: userspace   $(mk $(grep -q oom_score_adj /etc/rc.local 2>/dev/null && echo 1 || echo 0)) oom -900   $(mk $(grep -q 'auto-update=false' /etc/rc.local 2>/dev/null && echo 1 || echo 0)) autoupdate off   $(mk $(tailscale debug prefs 2>/dev/null | grep -A2 AutoUpdate | tr -d ' \t\n' | grep -q '"Check":false' && echo 1 || echo 0)) TS autoupdate выключен"; fi
     echo "  │ cron: ts-watchdog $(crontab -l 2>/dev/null | grep -c ts-watchdog) · сторож форкопа $(crontab -l 2>/dev/null | grep -cE 'forkop-watchdog|podkop-watchdog') · guard $(crontab -l 2>/dev/null | grep -c forkop-domain-guard) · fix-lists $(crontab -l 2>/dev/null | grep -cE 'forkop-fix-lists|podkop-fix-lists')   (по 1 — норма)"
     echo "  └──────────────────────────────────────────────────────────"
 }
@@ -307,20 +309,29 @@ stash() { # stash FILE — убрать лишний файл в бэкап (н�
     mv "$1" "$BAK/$(echo "$1" | tr / _).removed" 2>/dev/null && fixed "убран дубль: $1 (в $BAK)"
 }
 
-# 5.1 rc.local — ТОЧЕЧНО (свои строки роутера сохраняются)
-RC=/etc/rc.local
+# 5.1 rc.local — ТОЧЕЧНО, правка считается сделанной ТОЛЬКО если файл реально изменился (v7.2)
+RC=${V7_RC:-/etc/rc.local}
 HN=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 HN=$(echo "$HN" | tr '_' '-' | tr 'A-Z' 'a-z')
-if ! grep -q 'tailscaled' "$RC" 2>/dev/null; then
-    [ -f "$RC" ] && cp -p "$RC" "$BAK/rc.local"
-    cat > /tmp/rc.new << RCEOF
-#!/bin/sh
-# rc.local v7.0 — 2026-10-03 (эталон: userspace, oom -900, autoupdate off, hostname без "_")
+real_start() { grep -v '^[[:space:]]*#' "$1" 2>/dev/null | grep -cE 'tailscaled[[:space:]].*--(state|statedir|tun)'; }
+rc_fix() {
+    [ -f "$RC" ] || printf '#!/bin/sh\nexit 0\n' > "$RC"
+    REALSTART=$(real_start "$RC")
+    INITD_EN=0; /etc/init.d/tailscale enabled 2>/dev/null && INITD_EN=1
+    cp -p "$RC" "$BAK/rc.local" 2>/dev/null
+    if [ "$REALSTART" = "0" ]; then
+        if [ "$(grep -v '^[[:space:]]*#' "$RC" | grep -cE 'init\.d/tailscale[[:space:]]+(start|restart)')" -gt 0 ]; then
+            echo "  ✅ rc.local: запускает Tailscale командой init.d/tailscale start — НЕ трогаю (второй стартер не добавляю)"
+            return
+        fi
+        if [ "$INITD_EN" = "1" ]; then
+            echo "  ✅ rc.local: запуск Tailscale идёт через init.d (enabled) — rc.local и автозапуск НЕ трогаю (способ запуска вслепую не меняем)"
+            return
+        fi
+        # ни rc.local, ни init.d не запускают Tailscale → добавляем эталонный блок перед первым exit 0; чужие строки сохраняются
+        cat > /tmp/rc.blk << RCEOF
+# --- Tailscale (v7.2, эталон: userspace, oom -900, autoupdate off, hostname без "_") ---
 touch /tmp/rc-local-running
-if [ -f /root/tailscaled.state.backup ]; then
-    CURR=\$(wc -c < ${TS_STATEDIR}tailscaled.state 2>/dev/null || echo 0)
-    [ "\$CURR" -lt 1000 ] && cp /root/tailscaled.state.backup ${TS_STATEDIR}tailscaled.state && logger -t rc.local 'state restored from backup'
-fi
 (
 for i in 1 2 3 4 5 6 7 8 9 10; do
   ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 && break
@@ -333,28 +344,44 @@ for p in \$(pgrep tailscaled); do echo -900 > /proc/\$p/oom_score_adj 2>/dev/nul
 tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$HN &
 ( sleep 25; tailscale set --auto-update=false --update-check=false >/dev/null 2>&1 ) &   # autoupdate off after boot
 sleep 10
-logger -t rc.local 'tailscale up applied'
 rm -f /tmp/rc-local-running
 ) &
-exit 0
 RCEOF
-    if sh -n /tmp/rc.new; then cat /tmp/rc.new > "$RC"; chmod +x "$RC"; fixed "rc.local: записан эталонный (не было tailscaled), hostname=$HN"; else warn "rc.local: синтаксис не прошёл — НЕ записан"; fi
-    rm -f /tmp/rc.new
-else
-    cp -p "$RC" "$BAK/rc.local"; cp "$RC" /tmp/rc.new; RCCH=0
-    if grep -q 'tun=tailscale0' /tmp/rc.new; then sed -i 's/--tun=tailscale0/--tun=userspace-networking/g' /tmp/rc.new; RCCH=1; fixed "rc.local: --tun=tailscale0 → userspace-networking (вступит при следующем старте)"; fi
+        if grep -q '^exit 0' "$RC"; then awk 'FNR==NR{blk=blk $0 "\n"; next} !d && /^exit 0/ {printf "%s", blk; d=1} {print}' /tmp/rc.blk "$RC" > /tmp/rc.new; else { cat "$RC"; cat /tmp/rc.blk; echo "exit 0"; } > /tmp/rc.new; fi
+        if sh -n /tmp/rc.new && [ "$(real_start /tmp/rc.new)" -gt 0 ]; then cat /tmp/rc.new > "$RC"; chmod +x "$RC"; fixed "rc.local: добавлен запуск Tailscale (не было ни в rc.local, ни в init.d), свои строки сохранены"; else warn "rc.local: блок запуска не прошёл проверку — НЕ записан"; fi
+        rm -f /tmp/rc.blk /tmp/rc.new; return
+    fi
+    # есть настоящая строка запуска — точечные правки
+    cp "$RC" /tmp/rc.new
+    sed -i 's/--tun=tailscale0/--tun=userspace-networking/g' /tmp/rc.new
     if ! grep -q 'oom_score_adj' /tmp/rc.new; then
-        awk '{print} !d && /tailscaled/ && /(--state|--statedir)/ {print "sleep 1; for p in $(pgrep tailscaled); do echo -900 > /proc/$p/oom_score_adj 2>/dev/null; done   # OOM protection"; d=1}' /tmp/rc.new > /tmp/rc.new2 && cat /tmp/rc.new2 > /tmp/rc.new; rm -f /tmp/rc.new2; RCCH=1; fixed "rc.local: +oom_score_adj -900"
+        awk '{print} !d && /tailscaled/ && /--(state|statedir|tun)/ && !/^[[:space:]]*#/ {print "sleep 1; for p in $(pgrep tailscaled); do echo -900 > /proc/$p/oom_score_adj 2>/dev/null; done   # OOM protection"; d=1}' /tmp/rc.new > /tmp/rc.new2 && cat /tmp/rc.new2 > /tmp/rc.new; rm -f /tmp/rc.new2
     fi
     if ! grep -q 'auto-update=false' /tmp/rc.new; then
-        awk '{print} !d && /tailscale up / && !/tailscaled/ {print "( sleep 25; tailscale set --auto-update=false --update-check=false >/dev/null 2>&1 ) &   # autoupdate off after boot"; d=1}' /tmp/rc.new > /tmp/rc.new2 && cat /tmp/rc.new2 > /tmp/rc.new; rm -f /tmp/rc.new2; RCCH=1; fixed "rc.local: +autoupdate off после загрузки"
+        awk '{print} !d && /tailscale up / && !/tailscaled/ && !/^[[:space:]]*#/ {print "( sleep 25; tailscale set --auto-update=false --update-check=false >/dev/null 2>&1 ) &   # autoupdate off after boot"; d=1}' /tmp/rc.new > /tmp/rc.new2 && cat /tmp/rc.new2 > /tmp/rc.new; rm -f /tmp/rc.new2
     fi
     HNOLD=$(grep -o -e '--hostname=[^ ]*' /tmp/rc.new | head -1)
-    if echo "$HNOLD" | grep -q '[_A-Z]'; then HNNEW=$(echo "$HNOLD" | tr '_' '-' | tr 'A-Z' 'a-z'); sed -i "s|$HNOLD|$HNNEW|g" /tmp/rc.new; RCCH=1; fixed "rc.local: $HNOLD → $HNNEW"; fi
-    if [ "$RCCH" = 1 ]; then
-        if sh -n /tmp/rc.new; then cat /tmp/rc.new > "$RC"; chmod +x "$RC"; else warn "rc.local: синтаксис после правки не прошёл — НЕ записан"; fi
-    else echo "  ✅ rc.local: уже эталон (userspace, oom, autoupdate off)"; fi
+    if echo "$HNOLD" | grep -q '[_A-Z]'; then HNNEW=$(echo "$HNOLD" | tr '_' '-' | tr 'A-Z' 'a-z'); sed -i "s|$HNOLD|$HNNEW|g" /tmp/rc.new; fi
+    if cmp -s /tmp/rc.new "$RC"; then
+        echo "  ✅ rc.local: уже эталон (userspace, oom, autoupdate off)"
+        grep -q 'oom_score_adj' "$RC" || warn "rc.local: нет защиты от OOM, а строку запуска автоматически вставить не удалось (нестандартный формат) — поправить вручную"
+    else
+        if sh -n /tmp/rc.new && [ "$(real_start /tmp/rc.new)" -gt 0 ]; then
+            DIFFTXT=""
+            grep -q 'oom_score_adj' "$RC" || { grep -q 'oom_score_adj' /tmp/rc.new && DIFFTXT="$DIFFTXT +oom_score_adj"; }
+            grep -q 'auto-update=false' "$RC" || { grep -q 'auto-update=false' /tmp/rc.new && DIFFTXT="$DIFFTXT +autoupdate_off"; }
+            grep -q 'tun=tailscale0' "$RC" && DIFFTXT="$DIFFTXT tun0→userspace"
+            cat /tmp/rc.new > "$RC"; chmod +x "$RC"; fixed "rc.local: точечно исправлен:${DIFFTXT:- hostname}"
+        else warn "rc.local: после правки проверка не прошла — НЕ записан"; fi
+    fi
     rm -f /tmp/rc.new
+}
+rc_fix
+# rc.local.bak нужен сторожу ts-watchdog v6.6 (иначе он выходит с «rc.local.bak не найден»)
+if [ "$(real_start "$RC")" -gt 0 ]; then
+    if [ ! -f /etc/rc.local.bak ] || [ "$(real_start /etc/rc.local.bak)" = "0" ]; then cp -p "$RC" /etc/rc.local.bak && fixed "rc.local.bak создан/обновлён (нужен сторожу Tailscale)"; fi
+else
+    [ -f /etc/rc.local.bak ] || { cp -p "$RC" /etc/rc.local.bak 2>/dev/null; echo "  ℹ️  rc.local.bak создан (запуск Tailscale — через init.d)"; }
 fi
 
 # 5.2 ts-watchdog v6.6
@@ -697,7 +724,7 @@ stash /etc/hotplug.d/iface/30-podkop
 stash /etc/hotplug.d/net/99-vpn-tailscale
 stash /etc/hotplug.d/net/99-forkop-tailscale
 for f in /etc/init.d/forkop.bak* /etc/init.d/*.bak /etc/init.d/forkop.orig; do [ -e "$f" ] && stash "$f"; done
-[ "$(ls /etc/rc.d 2>/dev/null | grep -ic tailscale)" -gt 0 ] && { /etc/init.d/tailscale disable 2>/dev/null; echo "  🧹 автозапуск S80tailscale снят (запуск — из rc.local; демон не трогаем)"; }
+if [ "$(real_start "$RC")" -gt 0 ] && [ "$(ls /etc/rc.d 2>/dev/null | grep -ic tailscale)" -gt 0 ]; then /etc/init.d/tailscale disable 2>/dev/null; fixed "дубль запуска: автозапуск init.d/tailscale снят (запуск — из rc.local; демон не тронут)"; fi
 
 # 5.5 cron: канонические строки, дубли убраны (чужие строки сохраняются)
 CUR=$(crontab -l 2>/dev/null)

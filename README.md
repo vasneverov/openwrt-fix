@@ -170,7 +170,7 @@ sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix
 
 ---
 
-## fix-tailscale-openwrt.sh v7.3 — «ЭТАЛОН 03.10» + щит Tailscale (актуальная версия)
+## fix-tailscale-openwrt.sh v7.4 — «ЭТАЛОН 03.10» + щит Tailscale (актуальная версия)
 
 Тот же спасительный скрипт, та же команда. Безопасный режим: **без перезапусков и без ребута**, файлы эталона ставятся
 только если установленная версия **старее** (бэкап заменённого — `/root/rescue-v7-<дата>/`).
@@ -184,6 +184,8 @@ RESTART=1 sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fi
 
 **⛔ Железное правило: Tailscale не ломать никакими правками.** Демон `tailscaled` скрипт не останавливает и не перезапускает. «Щит Tailscale»: статус и pid до и после; если Tailscale был `Running`, а после правок нет — через 80 с скрипт сам откатывает файлы этого запуска из бэкапа и зовёт `ts-watchdog`. Ребут скрипт не делает никогда.
 
+
+**v7.4:** в заголовке выводится имя роутера из панели Tailscale.
 
 **v7.3:** перед установкой zram выполняется `opkg update`/`apk update` (без него на opkg-роутерах zram не ставился).
 

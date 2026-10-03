@@ -170,7 +170,7 @@ sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix
 
 ---
 
-## fix-tailscale-openwrt.sh v7.0 — «ЭТАЛОН 03.10» (актуальная версия)
+## fix-tailscale-openwrt.sh v7.1 — «ЭТАЛОН 03.10» + щит Tailscale (актуальная версия)
 
 Тот же спасительный скрипт, та же команда. Безопасный режим: **без перезапусков и без ребута**, файлы эталона ставятся
 только если установленная версия **старее** (бэкап заменённого — `/root/rescue-v7-<дата>/`).
@@ -180,6 +180,9 @@ sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix
 # применить правки конфига forkop одним рестартом:
 RESTART=1 sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 ```
+
+
+**⛔ Железное правило: Tailscale не ломать никакими правками.** Демон `tailscaled` скрипт не останавливает и не перезапускает. «Щит Tailscale»: статус и pid до и после; если Tailscale был `Running`, а после правок нет — через 80 с скрипт сам откатывает файлы этого запуска из бэкапа и зовёт `ts-watchdog`. Ребут скрипт не делает никогда.
 
 Что нового с v6.7 (07.09 → 03.10.2026):
 - блоки **«СОСТОЯНИЕ ДО / ПОСЛЕ»** с версиями и ✅/❌, список «исправлено» и «недочёты»;

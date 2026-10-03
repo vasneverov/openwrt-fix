@@ -2,7 +2,7 @@
 # OpenWrt Router Config Fix — Universal Rescue Script
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v7.0 — 2026-10-03  «ЭТАЛОН 03.10» (всё, что накоплено с 07.09 по 03.10.2026)
+# v7.1 — 2026-10-03  «ЭТАЛОН 03.10» + ЩИТ TAILSCALE (всё, что накоплено с 07.09 по 03.10.2026)
 #   Принцип: файлы эталона ставятся ТОЛЬКО если установленная версия СТАРШЕ (новее/равное не трогаем,
 #   бэкап заменённого — /root/rescue-v7-<дата>/). Без перезапусков сервисов и без ребута.
 #   Для вступления форкоп-правок в силу: RESTART=1 sh <(wget ...)  → ОДИН forkop restart в конце.
@@ -19,6 +19,9 @@
 #     дубли cron, автозапуск S80tailscale — убираются (в бэкап, не удаляются).
 #   - zram-swap (если нет и хватает места), пояс Europe/Moscow (zonename), filter_aaaa по версии sing-box
 #     (>=1.13: 1, иначе удалить), единый список GitHub-CDN в hosts.
+#   - ⛔ ЖЕЛЕЗНОЕ ПРАВИЛО (03.10.2026): Tailscale НЕ ломать НИКАКИМИ правками. Демон tailscaled не останавливается/не перезапускается,
+#     `tailscale up/down`, `/etc/init.d/tailscale stop|restart`, kill — НЕ вызываются. «Щит Tailscale» в конце: если TS был Running, а потом нет —
+#     через 80 с автооткат всех файлов этого запуска из бэкапа + вызов ts-watchdog. Ребут не делается никогда.
 #   - НЕ делает: не создаёт секции ai/kino и подписки (нужны ключи/подписки владельца — см. подсказку в конце),
 #     не трогает tailscaled/режим Tailscale на лету, не ребутит.
 #
@@ -32,7 +35,7 @@ HOSTNAME_VAL=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   OpenWrt Config Fix v7.0 — 2026-10-03              ║"
+echo "║   OpenWrt Config Fix v7.1 — 2026-10-03              ║"
 printf "║   Роутер: %-43s║\n" "$HOSTNAME_VAL"
 echo "║   Режим: БЕЗОПАСНЫЙ (без перезапусков)              ║"
 echo "╚══════════════════════════════════════════════════════╝"
@@ -270,6 +273,19 @@ snapshot() { # $1 = метка
     echo "  └──────────────────────────────────────────────────────────"
 }
 snapshot "СОСТОЯНИЕ ДО"
+TS_BEFORE=$(tailscale status --json 2>/dev/null | grep -m1 BackendState | cut -d'"' -f4)
+TS_PID0=$(pgrep tailscaled | tr '
+' ' ')
+echo "  🛡  ЩИТ TAILSCALE: до правок статус=${TS_BEFORE:-?} pid=${TS_PID0:-нет} (демон не трогаем; при провале — автооткат)"
+ts_shield_restore() { # вернуть файлы этого запуска из $BAK
+    for f in "$BAK"/_*; do
+        [ -e "$f" ] || continue
+        n=$(basename "$f"); case "$n" in *.removed) dest=$(echo "${n%.removed}" | tr _ /);; *) dest=$(echo "$n" | tr _ /);; esac
+        cp -p "$f" "$dest" 2>/dev/null && echo "     ↩ $dest"
+    done
+    [ -f "$BAK/rc.local" ] && cp -p "$BAK/rc.local" /etc/rc.local && echo "     ↩ /etc/rc.local"
+    [ -s "$BAK/crontab.before" ] && crontab "$BAK/crontab.before" && echo "     ↩ crontab"
+}
 
 # ── 5. ЭТАЛОН-ФАЙЛЫ v7.0 (03.10.2026): ставим ТОЛЬКО если версия старее ───────────────
 BAK=/root/rescue-v7-$(date +%Y%m%d-%H%M%S); mkdir -p "$BAK"
@@ -937,6 +953,21 @@ fi
 echo ""
 echo "═══════════════════════════════════════════"
 
+# ── ЩИТ TAILSCALE: проверка после правок ──────────────────────────────────────────
+TS_AFTER=$(tailscale status --json 2>/dev/null | grep -m1 BackendState | cut -d'"' -f4)
+if [ "$TS_BEFORE" = "Running" ] && [ "$TS_AFTER" != "Running" ]; then
+    echo "  🔴 ЩИТ TAILSCALE: был Running, сейчас ${TS_AFTER:-нет} — жду до 80 с (ts-watchdog сам лечит)…"
+    for _t in 1 2 3 4 5 6 7 8; do sleep 10; TS_AFTER=$(tailscale status --json 2>/dev/null | grep -m1 BackendState | cut -d'"' -f4); [ "$TS_AFTER" = "Running" ] && break; done
+    if [ "$TS_AFTER" != "Running" ]; then
+        echo "  🔴 Tailscale НЕ вернулся — ОТКАТ файлов этого запуска из $BAK:"; ts_shield_restore
+        [ -x /etc/ts-watchdog.sh ] && /etc/ts-watchdog.sh >/dev/null 2>&1
+        echo "  🔴 откат выполнен. Проверь: tailscale status"; echo "ЩИТ TAILSCALE: статус не вернулся → откат файлов" >> /tmp/v7.issues; WARNINGS=$((WARNINGS + 1))
+    else echo "  ✅ ЩИТ TAILSCALE: вернулся в Running"; fi
+fi
+TS_PID1=$(pgrep tailscaled | tr '
+' ' ')
+if [ "$TS_PID0" = "$TS_PID1" ]; then echo "  🛡  ЩИТ TAILSCALE: демон не перезапускался (pid ${TS_PID1:-нет} тот же), статус ${TS_AFTER:-?}"
+else echo "  ℹ️  ЩИТ TAILSCALE: pid изменился ($TS_PID0 → $TS_PID1) — это штатный рестарт сторожем, статус ${TS_AFTER:-?}"; fi
 snapshot "СОСТОЯНИЕ ПОСЛЕ"
 echo ""
 echo "  ┌── ИСПРАВЛЕНО В ЭТОМ ЗАПУСКЕ ─────────────────────────────"

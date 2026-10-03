@@ -167,3 +167,28 @@ sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix
 
 **Важно:** После скрипта нужно восстановить rc.local с authkey (если скрипт не нашёл ключ в старом rc.local).  
 Подробнее: шаг 7 в `flash_router_universal.md`.
+
+---
+
+## fix-tailscale-openwrt.sh v7.0 — «ЭТАЛОН 03.10» (актуальная версия)
+
+Тот же спасительный скрипт, та же команда. Безопасный режим: **без перезапусков и без ребута**, файлы эталона ставятся
+только если установленная версия **старее** (бэкап заменённого — `/root/rescue-v7-<дата>/`).
+
+```bash
+sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
+# применить правки конфига forkop одним рестартом:
+RESTART=1 sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
+```
+
+Что нового с v6.7 (07.09 → 03.10.2026):
+- блоки **«СОСТОЯНИЕ ДО / ПОСЛЕ»** с версиями и ✅/❌, список «исправлено» и «недочёты»;
+- **ИИ (ChatGPT/Claude/Claude Code):** секция `ai` ставится ПЕРВОЙ, ИИ-домены убираются из `main`; в конце проверка выхода
+  по `claude.ai/cdn-cgi/trace` (должно быть `US`, иначе Cloudflare блокирует: «Sorry, you have been blocked»);
+- ts-watchdog **v6.6**, forkop-watchdog **v2.1**, hotplug 30-vpn **v2**, сторож доменов **v3**, безопасные fix-lists;
+- `rc.local` правится **точечно** (userspace-networking, oom_score_adj −900, autoupdate off, hostname без «_»);
+- уборка дублей: `podkop-watchdog.sh`, `podkop-fix-lists.sh`, `30-forkop`, `99-vpn-tailscale`, `init.d/*.bak`, `S80tailscale`, дубли cron;
+- zram-swap, пояс Europe/Moscow, `filter_aaaa` по версии sing-box, исправлена проверка urltest (старая смотрела только `@urltest[0]`
+  и плодила дубль «Самый лучший»), `dns_server` больше не затирает список серверов.
+
+Секции `ai`/`kino` и подписки скрипт **не создаёт** (нужны подписки владельца) — в конце он подсказывает, как добавить.

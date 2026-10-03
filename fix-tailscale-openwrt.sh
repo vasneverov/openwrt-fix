@@ -2,61 +2,37 @@
 # OpenWrt Router Config Fix — Universal Rescue Script
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v6.6 — 2026-08-27
-#   - НОВОЕ (секция 8.4a): REBIND-ФИКС — dnsmasq rebind-защита режет fakeip-ответы
-#     sing-box (198.18.x) → «только WhatsApp/Telegram не работает у части клиентов»
-#     (logread: possible DNS-rebind attack detected: web.whatsapp.com). Скрипт ставит
-#     rebind_protection=0 + rebind_localhost=0 (урок x46-04/tr56-14, 27.08.2026).
-#   - НОВОЕ (секция 8.4): диагностика/фикс мёртвого dhcp_option. Если клиентам раздаётся
-#     fakeip-DNS (dhcp_option=6,198.18.0.2) — на этом IP НИКТО не слушает (sing-box на
-#     127.0.0.42, dnsmasq на <lan_ip>) → DNS клиентов мёртв → «ни один сайт не открывается»,
-#     а Telegram работает (у него свои IP). Скрипт находит и удаляет → клиенты идут через
-#     роутер. ГЛАВНЫЙ корень проблемы 49-puzikov (24.08.2026).
-#   - fix-lists: ВСЕ GitHub-домены в hosts (github.com + api + codeload + 4×raw +
-#     objects + release-assets + github-releases + githubassets + avatars).
-#     Старой версии (только raw.githubusercontent.com) НЕДОСТАТОЧНО: .srs списки
-#     forkop качает с github.com/.../releases/latest/download/ → 302-редирект на CDN.
-#     Если CDN-домены не в hosts → файл 0 байт → /tmp/sing-box/rulesets пуст →
-#     set forkop_subnets (fakeip) пуст → tproxy не маркирует клиентский трафик →
-#     VPN для клиентов мёртв (а curl с роутера ОБХОДИТ tproxy и «YouTube 200» ложно!).
-#   - update_interval='1h' (обновление списков каждый час, не 1 день)
-#   - fix-lists самозапускается: если rulesets пуст → скачивает списки
-#   - ts-watchdog v6.3 (offline netmap timeout fix) — мигающая серая точка
-#   Универсальный спасительный скрипт для роутеров с Podkop ИЛИ Forkop.
-#   БЕЗОПАСНЫЙ режим: никаких перезапусков сервисов!
-#   Можно запускать удалённо через SSH (в т.ч. через Tailscale) — соединение не рвётся.
-#   Всё что меняется — файлы конфигов и UCI. Эффект — после следующего ребута.
+# v7.0 — 2026-10-03  «ЭТАЛОН 03.10» (всё, что накоплено с 07.09 по 03.10.2026)
+#   Принцип: файлы эталона ставятся ТОЛЬКО если установленная версия СТАРШЕ (новее/равное не трогаем,
+#   бэкап заменённого — /root/rescue-v7-<дата>/). Без перезапусков сервисов и без ребута.
+#   Для вступления форкоп-правок в силу: RESTART=1 sh <(wget ...)  → ОДИН forkop restart в конце.
+#   - ts-watchdog v6.6 (oom_score_adj -900, ловит «failed to connect to local tailscaled», autoupdate off после
+#     рестарта, --hostname без «_»), forkop-watchdog v2.1 (грейс 180 с после загрузки, не рестартует при идущем
+#     init.d, LAN из uci), hotplug 30-vpn v2 (рестарт форкопа на ifup wan только при аптайме >=150 с),
+#     сторож доменов v3 (ИИ-домены ТОЛЬКО в секции ai, кино ТОЛЬКО в kino), безопасные fix-lists.
+#   - ИИ (ChatGPT/Claude/Claude Code): секция ai ПЕРВОЙ в списке секций + ИИ-домены убираются из main
+#     (иначе правило main с IP-диапазонами Cloudflare перехватывает claude.ai/chatgpt.com и Cloudflare
+#     блокирует выход NL/PL: «Sorry, you have been blocked»). В конце — проверка выхода по cdn-cgi/trace.
+#   - rc.local: НЕ переписывается целиком — точечно: userspace-networking, oom_score_adj -900, autoupdate off
+#     после загрузки, hostname без «_» (свои строки роутера сохраняются).
+#   - дубли: podkop-watchdog.sh/podkop-fix-lists.sh (forkop), hotplug 30-forkop и 99-vpn-tailscale, init.d/*.bak,
+#     дубли cron, автозапуск S80tailscale — убираются (в бэкап, не удаляются).
+#   - zram-swap (если нет и хватает места), пояс Europe/Moscow (zonename), filter_aaaa по версии sing-box
+#     (>=1.13: 1, иначе удалить), единый список GitHub-CDN в hosts.
+#   - НЕ делает: не создаёт секции ai/kino и подписки (нужны ключи/подписки владельца — см. подсказку в конце),
+#     не трогает tailscaled/режим Tailscale на лету, не ребутит.
 #
-#   Что делает:
-#   - Определяет версию OpenWrt (25.x / 24.x / другая)
-#   - Определяет тип VPN: podkop (itdog) ИЛИ forkop (ushan0v) — автодетект
-#   - Определяет версию tailscale: 1.96.5 OPX ИЛИ 1.98.9+ GuNanOvO UPX — обе ОК
-#   - Определяет statedir tailscale (/etc/tailscale/ или /var/lib/tailscale/)
-#   - Сохраняет state backup (если state > 1000 байт)
-#   - UCI: fw_mode=none, autoupdate=false, log_stderr/stdout=0
-#   - UCI: exclude_ntp=1, dns_server (для podkop или forkop)
-#   - init.d/tailscale DISABLED (если существует — НЕ останавливает)
-#   - Пишет правильный rc.local (state restore, hostname, правильный statedir)
-#   - Пишет ts-watchdog v6.3 (offline netmap timeout fix, NoState, state restore, lock)
-#   - Создаёт VPN watchdog (podkop-watchdog.sh → /etc/init.d/podkop ИЛИ forkop)
-#   - Создаёт листовой скрипт (GitHub CDN разблокировка → podkop ИЛИ forkop list_update)
-#   - Создаёт hotplug: restart VPN при WAN up (30-podkop ИЛИ 30-forkop)
-#   - Создаёт hotplug: restart VPN при tailscale0 up (99-vpn-tailscale)
-#   - Добавляет все cron задачи (если нет)
-#   - Запускает crond если не работает
-#   - Урезает логи (log_size=64, conloglevel=3, cronloglevel=0)
+# v6.7 — 2026-09-07: эталон форкопа — urltest «Самый лучший», sort_by_latency, badwan, meta первый, domain WhatsApp.
+# v6.6 — 2026-08-27: REBIND-ФИКС dnsmasq (fakeip 198.18.x режется). v6.5 — мёртвый dhcp_option (fakeip-DNS клиентам).
+# v6.4 — все GitHub-CDN в hosts, update_interval 1h. v6.3 — jsDelivr-зеркало + DoH. v6.1 — apk HTTP, MSK, NTP.
 #
-#   Что НЕ делает:
-#   - НЕ перезапускает tailscaled
-#   - НЕ перезапускает podkop/forkop
-#   - НЕ меняет бинарь tailscale
-#   - НЕ делает reboot
-
+#   Универсальный спасительный скрипт для роутеров с Podkop ИЛИ Forkop (автодетект).
+#   БЕЗОПАСНЫЙ режим: никаких перезапусков сервисов! Можно запускать удалённо через SSH/Tailscale.
 HOSTNAME_VAL=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   OpenWrt Config Fix v6.7 — 2026-09-07              ║"
+echo "║   OpenWrt Config Fix v7.0 — 2026-10-03              ║"
 printf "║   Роутер: %-43s║\n" "$HOSTNAME_VAL"
 echo "║   Режим: БЕЗОПАСНЫЙ (без перезапусков)              ║"
 echo "╚══════════════════════════════════════════════════════╝"
@@ -168,10 +144,10 @@ fi
 # ── 3.5. UCI настройки — VPN (podkop ИЛИ forkop) ───────────────────────────
 if [ "$VPN_TYPE" != "none" ]; then
     uci set ${VPN_CONFIG}.settings.exclude_ntp='1' 2>/dev/null
-    uci set ${VPN_CONFIG}.settings.dns_server='1.1.1.1' 2>/dev/null
+    [ -z "$(uci -q get ${VPN_CONFIG}.settings.dns_server)" ] && uci set ${VPN_CONFIG}.settings.dns_server='1.1.1.1' 2>/dev/null
     uci set ${VPN_CONFIG}.settings.update_interval='1h' 2>/dev/null
     uci commit ${VPN_CONFIG} 2>/dev/null
-    echo "  ✅ ${VPN_TYPE} UCI: exclude_ntp=1, dns=1.1.1.1, update_interval=1h"
+    echo "  ✅ ${VPN_TYPE} UCI: exclude_ntp=1, dns_server (если не задан), update_interval=1h"
 fi
 
 # ── 3.6. ЭТАЛОН ФОРКОПА (07.09.2026) — вдохнуть жизнь в сервисы на старом роутере ──
@@ -188,8 +164,9 @@ fi
 if [ "$VPN_TYPE" = "forkop" ]; then
     echo "  ── Эталон форкопа (07.09) ──"
     # 1) urltest «Самый лучший» (если нет ни «Самый лучший», ни «Лучший»)
-    URTEST_NAME=$(uci get forkop.@urltest[0].name 2>/dev/null)
-    if [ "$URTEST_NAME" != "Самый лучший" ] && [ "$URTEST_NAME" != "Лучший" ]; then
+    URTEST_NAME="Самый лучший"
+    HAS_MAIN_UT=$(uci show forkop 2>/dev/null | grep -cE "^forkop\.@urltest\[[0-9]+\]\.section='main'")
+    if [ "$HAS_MAIN_UT" -eq 0 ]; then
         uci add forkop urltest
         uci set forkop.@urltest[-1].section='main'
         uci set forkop.@urltest[-1].name='Самый лучший'
@@ -202,7 +179,7 @@ if [ "$VPN_TYPE" = "forkop" ]; then
         uci set forkop.@urltest[-1].filter_mode='disabled'
         echo "  ✅ urltest «Самый лучший»: создан"
     else
-        echo "  ✅ urltest «Самый лучший»: уже есть ($URTEST_NAME)"
+        echo "  ✅ urltest main: уже есть ($HAS_MAIN_UT шт.)"
     fi
     # 2) sort_by_latency=1 (галочка «сортировать по задержке»)
     uci set forkop.main.sort_by_latency='1'
@@ -262,42 +239,115 @@ else
     echo "  ℹ️  init.d/tailscale: не найден (tailscale управляется через rc.local)"
 fi
 
-# ── 5. rc.local ────────────────────────────────────────────────────────────
-cat > /etc/rc.local << RCEOF
+# ── 4.9. Помощники отчёта и снимок «ДО» ───────────────────────────────────────────
+rm -f /tmp/v7.fixed /tmp/v7.issues
+fixed() { echo "$1" >> /tmp/v7.fixed; echo "  ✅ $1"; }
+warn()  { WARNINGS=$((WARNINGS + 1)); echo "$1" >> /tmp/v7.issues; echo "  ⚠️  $1"; }
+mk() { [ "$1" = "1" ] && printf '✅' || printf '❌'; }
+snapshot() { # $1 = метка
+    echo ""
+    echo "  ┌── $1 ──────────────────────────────────────────────"
+    _BR=opkg; command -v apk >/dev/null 2>&1 && _BR=apk
+    _SB=$(sing-box version 2>/dev/null | head -1 | awk '{print $3}')
+    echo "  │ OpenWrt $OPENWRT_VER · пакеты: $_BR · аптайм $(( $(cut -d. -f1 /proc/uptime) / 86400 ))д · LAN $(uci -q get network.lan.ipaddr) · пояс $(uci -q get system.@system[0].zonename)"
+    echo "  │ sing-box ${_SB:-нет} · tailscale $(tailscale version 2>/dev/null | head -1) · $(tailscale status --json 2>/dev/null | grep -m1 BackendState | cut -d'"' -f4)"
+    _TUN=$(ps 2>/dev/null | grep '[t]ailscaled' | grep -o 'tun=[a-z0-9-]*' | head -1)
+    echo "  │ режим Tailscale (запущенный демон): ${_TUN:-?} · в rc.local: $(grep -o 'tun=[a-z0-9-]*' /etc/rc.local 2>/dev/null | head -1)"
+    if [ "$VPN_TYPE" = "forkop" ]; then
+        _SEC=$(uci show forkop 2>/dev/null | grep -E '=section$' | cut -d. -f2 | cut -d= -f1 | tr '
+' ' ')
+        _FIRST=$(uci show forkop 2>/dev/null | grep -E '=section$' | head -1 | cut -d= -f1)
+        echo "  │ forkop: $(/etc/init.d/forkop status 2>&1 | head -1) · секции по порядку: ${_SEC}"
+        for _S in main kino ai; do echo "  │   подписок $_S: $(uci show forkop 2>/dev/null | grep -cE "subscription_url\[[0-9]+\]\.section='$_S'")  urltest: $(uci show forkop 2>/dev/null | grep -cE "^forkop\.@urltest\[[0-9]+\]\.section='$_S'")"; done
+        echo "  │ $(mk $([ "$(uci -q get forkop.ai)" = section ] && echo 1 || echo 0)) секция ai есть   $(mk $([ "$_FIRST" = forkop.ai ] && echo 1 || echo 0)) ai ПЕРВАЯ   $(mk $([ "$(uci -q get forkop.kino)" = section ] && echo 1 || echo 0)) секция kino есть"
+        echo "  │ $(mk $([ "$(uci -q get forkop.main.domain | tr ' ' '
+' | grep -cE 'anthropic|claude|openai|chatgpt|sora')" = 0 ] && echo 1 || echo 0)) ИИ-доменов в main нет   $(mk $(grep -q 'guard.sh v3' /etc/forkop-domain-guard.sh 2>/dev/null && echo 1 || echo 0)) сторож доменов v3   $(mk $(grep -q 'boot grace' /etc/forkop-watchdog.sh 2>/dev/null && echo 1 || echo 0)) сторож форкопа v2.1"
+    fi
+    echo "  │ $(mk $(grep -q 'ts-watchdog v6.6' /etc/ts-watchdog.sh 2>/dev/null && echo 1 || echo 0)) ts-watchdog v6.6   $(mk $(grep -q uptime /etc/hotplug.d/iface/30-vpn 2>/dev/null && echo 1 || echo 0)) hotplug 30-vpn v2   $(mk $([ "$(ls /etc/hotplug.d/iface 2>/dev/null | grep -c '^30-')" = 1 ] && echo 1 || echo 0)) один hotplug 30-*   $(mk $(grep -q zram /proc/swaps 2>/dev/null && echo 1 || echo 0)) zram"
+    echo "  │ $(mk $(grep -q userspace-networking /etc/rc.local 2>/dev/null && echo 1 || echo 0)) rc.local: userspace   $(mk $(grep -q oom_score_adj /etc/rc.local 2>/dev/null && echo 1 || echo 0)) oom -900   $(mk $(grep -q 'auto-update=false' /etc/rc.local 2>/dev/null && echo 1 || echo 0)) autoupdate off   $(mk $(tailscale debug prefs 2>/dev/null | grep -A2 AutoUpdate | tr -d ' 	
+' | grep -q '"Check":false' && echo 1 || echo 0)) TS autoupdate выключен"
+    echo "  │ cron: ts-watchdog $(crontab -l 2>/dev/null | grep -c ts-watchdog) · сторож форкопа $(crontab -l 2>/dev/null | grep -cE 'forkop-watchdog|podkop-watchdog') · guard $(crontab -l 2>/dev/null | grep -c forkop-domain-guard) · fix-lists $(crontab -l 2>/dev/null | grep -cE 'forkop-fix-lists|podkop-fix-lists')   (по 1 — норма)"
+    echo "  └──────────────────────────────────────────────────────────"
+}
+snapshot "СОСТОЯНИЕ ДО"
+
+# ── 5. ЭТАЛОН-ФАЙЛЫ v7.0 (03.10.2026): ставим ТОЛЬКО если версия старее ───────────────
+BAK=/root/rescue-v7-$(date +%Y%m%d-%H%M%S); mkdir -p "$BAK"
+FK_CHANGED=0
+put() { # put DEST SRC MARKER — установить эталон, если в DEST нет MARKER (бэкап старого)
+    DEST="$1"; SRC="$2"; MARK="$3"
+    if [ -f "$DEST" ] && grep -q "$MARK" "$DEST" 2>/dev/null; then
+        echo "  ✅ $DEST: уже эталон ($MARK)"; rm -f "$SRC"; return
+    fi
+    if ! sh -n "$SRC" 2>/dev/null; then
+        warn "$DEST: синтаксис эталона не прошёл — файл НЕ тронут"; rm -f "$SRC"; return
+    fi
+    [ -f "$DEST" ] && cp -p "$DEST" "$BAK/$(echo "$DEST" | tr / _)"
+    cat "$SRC" > "$DEST" && chmod +x "$DEST" && fixed "$DEST: обновлён до эталона ($MARK)"
+    rm -f "$SRC"
+}
+stash() { # stash FILE — убрать лишний файл в бэкап (не удалять)
+    [ -e "$1" ] || return
+    mv "$1" "$BAK/$(echo "$1" | tr / _).removed" 2>/dev/null && fixed "убран дубль: $1 (в $BAK)"
+}
+
+# 5.1 rc.local — ТОЧЕЧНО (свои строки роутера сохраняются)
+RC=/etc/rc.local
+HN=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
+HN=$(echo "$HN" | tr '_' '-' | tr 'A-Z' 'a-z')
+if ! grep -q 'tailscaled' "$RC" 2>/dev/null; then
+    [ -f "$RC" ] && cp -p "$RC" "$BAK/rc.local"
+    cat > /tmp/rc.new << RCEOF
 #!/bin/sh
-# rc.local v6.1 — 2026-07-25
-# touch /tmp/rc-local-running — watchdog не мешает rc.local
-# statedir: $TS_STATEDIR (определено автоматически)
-# VPN: $VPN_TYPE (автодетект)
-
+# rc.local v7.0 — 2026-10-03 (эталон: userspace, oom -900, autoupdate off, hostname без "_")
 touch /tmp/rc-local-running
-/etc/init.d/tailscale disable 2>/dev/null
-
 if [ -f /root/tailscaled.state.backup ]; then
     CURR=\$(wc -c < ${TS_STATEDIR}tailscaled.state 2>/dev/null || echo 0)
-    if [ "\$CURR" -lt 1000 ]; then
-        cp /root/tailscaled.state.backup ${TS_STATEDIR}tailscaled.state
-        logger -t rc.local 'state restored from backup'
-    fi
+    [ "\$CURR" -lt 1000 ] && cp /root/tailscaled.state.backup ${TS_STATEDIR}tailscaled.state && logger -t rc.local 'state restored from backup'
 fi
-
-mkdir -p /var/run/tailscale $TS_STATEDIR
-rm -f /var/run/tailscale/tailscaled.sock
-tailscaled --statedir=$TS_STATEDIR --tun=userspace-networking >> /tmp/ts.log 2>&1 &
+(
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 && break
+  sleep 3
+done
+mkdir -p /var/run/tailscale ${TS_STATEDIR}
+tailscaled --state=${TS_STATEDIR}tailscaled.state --tun=userspace-networking --statedir=${TS_STATEDIR} >> /tmp/ts.log 2>&1 &
 sleep 5
-tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$HOSTNAME_VAL &
-
-logger -t rc.local 'Tailscale started'
+for p in \$(pgrep tailscaled); do echo -900 > /proc/\$p/oom_score_adj 2>/dev/null; done   # OOM protection
+tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$HN &
+( sleep 25; tailscale set --auto-update=false --update-check=false >/dev/null 2>&1 ) &   # autoupdate off after boot
+sleep 10
+logger -t rc.local 'tailscale up applied'
 rm -f /tmp/rc-local-running
+) &
 exit 0
 RCEOF
-chmod +x /etc/rc.local
-echo "  ✅ rc.local: записан (statedir=$TS_STATEDIR, hostname=$HOSTNAME_VAL, vpn=$VPN_TYPE)"
+    if sh -n /tmp/rc.new; then cat /tmp/rc.new > "$RC"; chmod +x "$RC"; fixed "rc.local: записан эталонный (не было tailscaled), hostname=$HN"; else warn "rc.local: синтаксис не прошёл — НЕ записан"; fi
+    rm -f /tmp/rc.new
+else
+    cp -p "$RC" "$BAK/rc.local"; cp "$RC" /tmp/rc.new; RCCH=0
+    if grep -q 'tun=tailscale0' /tmp/rc.new; then sed -i 's/--tun=tailscale0/--tun=userspace-networking/g' /tmp/rc.new; RCCH=1; fixed "rc.local: --tun=tailscale0 → userspace-networking (вступит при следующем старте)"; fi
+    if ! grep -q 'oom_score_adj' /tmp/rc.new; then
+        awk '{print} !d && /tailscaled/ && /(--state|--statedir)/ {print "sleep 1; for p in $(pgrep tailscaled); do echo -900 > /proc/$p/oom_score_adj 2>/dev/null; done   # OOM protection"; d=1}' /tmp/rc.new > /tmp/rc.new2 && cat /tmp/rc.new2 > /tmp/rc.new; rm -f /tmp/rc.new2; RCCH=1; fixed "rc.local: +oom_score_adj -900"
+    fi
+    if ! grep -q 'auto-update=false' /tmp/rc.new; then
+        awk '{print} !d && /tailscale up / && !/tailscaled/ {print "( sleep 25; tailscale set --auto-update=false --update-check=false >/dev/null 2>&1 ) &   # autoupdate off after boot"; d=1}' /tmp/rc.new > /tmp/rc.new2 && cat /tmp/rc.new2 > /tmp/rc.new; rm -f /tmp/rc.new2; RCCH=1; fixed "rc.local: +autoupdate off после загрузки"
+    fi
+    HNOLD=$(grep -o -e '--hostname=[^ ]*' /tmp/rc.new | head -1)
+    if echo "$HNOLD" | grep -q '[_A-Z]'; then HNNEW=$(echo "$HNOLD" | tr '_' '-' | tr 'A-Z' 'a-z'); sed -i "s|$HNOLD|$HNNEW|g" /tmp/rc.new; RCCH=1; fixed "rc.local: $HNOLD → $HNNEW"; fi
+    if [ "$RCCH" = 1 ]; then
+        if sh -n /tmp/rc.new; then cat /tmp/rc.new > "$RC"; chmod +x "$RC"; else warn "rc.local: синтаксис после правки не прошёл — НЕ записан"; fi
+    else echo "  ✅ rc.local: уже эталон (userspace, oom, autoupdate off)"; fi
+    rm -f /tmp/rc.new
+fi
 
-# ── 6. ts-watchdog v6.3 ────────────────────────────────────────────────────
-cat > /etc/ts-watchdog.sh << 'WEOF'
+# 5.2 ts-watchdog v6.6
+cat > /tmp/v7.tswd << 'V7_TSWD'
 #!/bin/sh
-# ts-watchdog v6.3 — 2026-07-31
+# ts-watchdog v6.6 — 02.10.2026: tailscale up --hostname sanitized (tailscale 1.102.x rejects "_" in DNS labels: VasyaOnline_NN)
+# ts-watchdog v6.5 — 02.10.2026: +oom_score_adj=-900 for tailscaled (boot memory peak OOM-killed tailscaled on 233 MB routers)
+# ts-watchdog v6.4 — 02.10.2026: +wedged-daemon check, +AutoUpdate re-off after restart (CLI cannot reach tailscaled after network reload / forkop restart)
+# ts-watchdog v6.3 — 2026-07-31 · restart_ts per etalon (setsid+socket) 01.10.2026
 # v6.3: перезапуск при offline (интернет есть) — netmap timeout fix.
 # Мигающая серая точка: long-poll к controlplane рвётся через sing-box → tailscale
 # показывает 'offline' при живом интернете. v6.3 это ловит и перезапускает.
@@ -316,7 +366,7 @@ fi
 
 HOSTNAME_VAL=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 LOCKFILE=/tmp/ts-watchdog.lock
-TS_STATEDIR="__TS_STATEDIR__"
+TS_STATEDIR="/etc/tailscale/"
 RC_BACKUP="/etc/rc.local.bak"
 
 if [ -f "$LOCKFILE" ]; then
@@ -324,6 +374,8 @@ if [ -f "$LOCKFILE" ]; then
     if kill -0 "$LOCKPID" 2>/dev/null; then exit 0; fi
 fi
 echo $$ > "$LOCKFILE"
+# v6.5: keep tailscaled away from the OOM killer (idempotent, every run)
+for p in $(pgrep tailscaled 2>/dev/null); do echo -900 > /proc/$p/oom_score_adj 2>/dev/null; done
 
 # rc.local восстановление
 if [ ! -f "$RC_BACKUP" ]; then
@@ -348,14 +400,18 @@ restart_ts() {
     logger -t ts-watchdog "$1"
     killall tailscale 2>/dev/null; sleep 1
     killall tailscaled 2>/dev/null; sleep 2
+    mkdir -p /var/run/tailscale
     rm -f /var/run/tailscale/tailscaled.sock
-    tailscaled --statedir="$TS_STATEDIR" --tun=userspace-networking >> /tmp/ts.log 2>&1 &
-    sleep 5
-    tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$HOSTNAME_VAL &
+    setsid tailscaled --state="${TS_STATEDIR}tailscaled.state" --statedir="$TS_STATEDIR" \
+      --tun=userspace-networking --socket=/var/run/tailscale/tailscaled.sock >> /tmp/ts.log 2>&1 &
+    sleep 8
+    tailscale up --accept-dns=false --accept-routes --netfilter-mode=off --hostname=$(echo "$HOSTNAME_VAL" | tr "_" "-" | tr "A-Z" "a-z") >> /tmp/ts.log 2>&1 &
+    ( sleep 20; tailscale set --auto-update=false --update-check=false >/dev/null 2>&1 ) &   # v6.4: tailscale up resets AutoUpdate to default
+    for p in $(pgrep tailscaled 2>/dev/null); do echo -900 > /proc/$p/oom_score_adj 2>/dev/null; done
     logger -t ts-watchdog "tailscaled restarted"
 }
 
-TS_STATUS=$(tailscale status 2>&1 | head -1)
+TS_STATUS=$(tailscale status --self=true --peers=false 2>&1 | head -1)
 
 # 1. tailscaled alive check
 if ! pgrep tailscaled > /dev/null 2>&1; then
@@ -369,6 +425,11 @@ if echo "$TS_STATUS" | grep -q "NoState"; then
     rm -f "$LOCKFILE"; exit 0
 fi
 
+# 2b. v6.4: tailscaled process alive but CLI cannot reach it (wedged after wifi/network reload or forkop restart)
+if echo "$TS_STATUS" | grep -q "failed to connect to local tailscaled"; then
+    restart_ts "daemon wedged (CLI cannot connect), restarting..."
+    rm -f "$LOCKFILE"; exit 0
+fi
 # 3. offline при живом интернете — netmap timeout (v6.3)
 if echo "$TS_STATUS" | grep -q "offline"; then
     if ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
@@ -378,148 +439,308 @@ if echo "$TS_STATUS" | grep -q "offline"; then
 fi
 
 rm -f "$LOCKFILE"
-WEOF
-sed -i "s|__TS_STATEDIR__|$TS_STATEDIR|g" /etc/ts-watchdog.sh
-chmod +x /etc/ts-watchdog.sh
-echo "  ✅ ts-watchdog: v6.3 записан (statedir=$TS_STATEDIR)"
+V7_TSWD
+put /etc/ts-watchdog.sh /tmp/v7.tswd 'ts-watchdog v6.6'
 
-# ── 7. VPN watchdog (podkop ИЛИ forkop) ────────────────────────────────────
-# Файл называется podkop-watchdog.sh для совместимости со старыми установками
-# Но внутри вызывает правильный init.d
-VPN_WATCHDOG_INITD="$VPN_INITD"
-if [ -z "$VPN_WATCHDOG_INITD" ]; then
-    # Fallback: попробовать оба
-    if [ -f /etc/init.d/forkop ]; then
-        VPN_WATCHDOG_INITD="/etc/init.d/forkop"
-    elif [ -f /etc/init.d/podkop ]; then
-        VPN_WATCHDOG_INITD="/etc/init.d/podkop"
-    else
-        VPN_WATCHDOG_INITD="/etc/init.d/podkop"
-    fi
-fi
-
-if [ ! -f /etc/podkop-watchdog.sh ]; then
-    cat > /etc/podkop-watchdog.sh << EOF
+# 5.3 forkop-часть (для podkop — только предупреждение: podkop устарел, мигрировать на forkop)
+if [ "$VPN_TYPE" = "forkop" ]; then
+cat > /tmp/v7.fkwd << 'V7_FKWD'
 #!/bin/sh
-# VPN watchdog — restarts ${VPN_TYPE} (sing-box) if down
-if ! pgrep sing-box > /dev/null 2>&1; then
-    logger -t ${VPN_TYPE}-watchdog 'sing-box not running, restarting ${VPN_TYPE}'
-    ${VPN_WATCHDOG_INITD} restart
-fi
-EOF
-    chmod +x /etc/podkop-watchdog.sh
-    echo "  ✅ VPN watchdog: создан (${VPN_TYPE} → ${VPN_WATCHDOG_INITD})"
-else
-    # Проверить что watchdog ссылается на правильный init.d
-    if grep -q "$VPN_WATCHDOG_INITD" /etc/podkop-watchdog.sh 2>/dev/null; then
-        echo "  ✅ VPN watchdog: уже правильный (${VPN_TYPE})"
-    else
-        # Переписать если ссылается на старый init.d (например podkop вместо forkop)
-        cat > /etc/podkop-watchdog.sh << EOF
-#!/bin/sh
-# VPN watchdog — restarts ${VPN_TYPE} (sing-box) if down
-if ! pgrep sing-box > /dev/null 2>&1; then
-    logger -t ${VPN_TYPE}-watchdog 'sing-box not running, restarting ${VPN_TYPE}'
-    ${VPN_WATCHDOG_INITD} restart
-fi
-EOF
-        chmod +x /etc/podkop-watchdog.sh
-        echo "  ✅ VPN watchdog: переписан (${VPN_TYPE} → ${VPN_WATCHDOG_INITD})"
-    fi
+# forkop-watchdog v2.1 — СТОРОЖ-ДИАГНОСТ «зелёный форкоп, но клиенты мимо туннеля»
+# Проверяет ГЛАВНУЮ болезнь x46-29 (30.09.2026): клиенты получают РЕАЛЬНЫЙ IP вместо fakeip.
+# Ставить: /etc/forkop-watchdog.sh + cron */5
+# Логика: тихо, если всё ок. Кричит — если клиентский DNS не отдаёт fakeip.
+# v2.1 (02.10.2026): LAN IP from uci (the 192.168.5.1 default made the watchdog misfire on routers with another LAN: it "healed" by cutting inet6_range out of the generator -> AAAA hang on sing-box 1.12)
+LAN_IP="${1:-$(uci -q get network.lan.ipaddr | cut -d/ -f1)}"; [ -z "$LAN_IP" ] && LAN_IP=192.168.5.1
+LOG="/tmp/forkop-watchdog.log"
+
+# v2 (02.10.2026): boot grace + no overlapping restarts + restart cooldown.
+# A forkop start takes 50-60 s (running=0 / dns_configured=0 meanwhile): the old watchdog restarted it DURING its own start
+# (restart cascade after reboot, 2-3 min to stable; 36 stuck init.d restarts seen on s78-18).
+UP=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+[ "${UP:-0}" -lt 180 ] && exit 0                       # boot grace
+ps 2>/dev/null | grep -q "[i]nit.d/forkop" && exit 0   # a start/restart is already in progress
+CD=/tmp/forkop-wd.last; NOW=$(date +%s)
+wd_restart(){ if [ -f $CD ] && [ $((NOW-$(cat $CD 2>/dev/null || echo 0))) -lt 180 ]; then exit 0; fi; echo $NOW > $CD; /etc/init.d/forkop restart >/dev/null 2>&1 & }
+
+# 1) форкоп жив?
+ST=$(/usr/bin/forkop get_status 2>/dev/null)
+RUN=$(echo "$ST" | grep -o '"running": [0-9]*' | grep -o '[0-9]')
+DNS=$(echo "$ST" | grep -o '"dns_configured": [0-9]*' | grep -o '[0-9]')
+if [ "$RUN" != "1" ] || [ "$DNS" != "1" ]; then
+  logger -t forkop-watchdog "ФОРКОП НЕ РАБОТАЕТ: running=$RUN dns=$DNS — restarting"
+  wd_restart
+  exit 0
 fi
 
-# ── 8. Листовой скрипт — GitHub CDN разблокировка ─────────────────────────
-VPN_LIST_BIN="$VPN_BIN"
-if [ -z "$VPN_LIST_BIN" ]; then
-    if [ -f /usr/bin/forkop ]; then
-        VPN_LIST_BIN="/usr/bin/forkop"
-    elif [ -f /usr/bin/podkop ]; then
-        VPN_LIST_BIN="/usr/bin/podkop"
-    else
-        VPN_LIST_BIN="/usr/bin/podkop"
+# 2) ГЛАВНОЕ: клиент получает fakeip? (это была причина 5 часов мучений)
+FIP=$(dig +short +time=3 +tries=1 www.youtube.com @$LAN_IP 2>/dev/null | head -1)
+case "$FIP" in
+  198.18.*|198.19.*)
+    : # ОК — fakeip раздаётся клиентам
+    ;;
+  *)
+    # 🔴 БОЛЕЗНЬ: клиенты получают реальный IP → мимо туннеля
+    logger -t forkop-watchdog "🔴 КЛИЕНТЫ ПОЛУЧАЮТ РЕАЛЬНЫЙ IP ($FIP) — не fakeip! ЛЕЧУ"
+    echo "$(date '+%F %T') БОЛЕЗНЬ: $LAN_IP отдал $FIP вместо fakeip" >> $LOG
+    # ЛЕЧЕНИЕ №1: конфликт /etc/dnsmasq.conf (главная причина!)
+    if grep -qE "^server=" /etc/dnsmasq.conf 2>/dev/null; then
+      echo "$(date '+%F %T') ЛЕЧУ: чищу server= из /etc/dnsmasq.conf" >> $LOG
+      sed -i "/^server=/d; /^no-resolv/d" /etc/dnsmasq.conf
+      /etc/init.d/dnsmasq restart >/dev/null 2>&1
     fi
+    # ЛЕЧЕНИЕ №2: uci-настройка dnsmasq
+    SRV=$(uci get dhcp.@dnsmasq[0].server 2>/dev/null | tr -d ' ')
+    if [ "$SRV" != "127.0.0.42" ]; then
+      echo "$(date '+%F %T') ЛЕЧУ: uci server → 127.0.0.42" >> $LOG
+      uci set dhcp.@dnsmasq[0].server='127.0.0.42'
+      uci set dhcp.@dnsmasq[0].noresolv='1'
+      uci commit dhcp
+      /etc/init.d/dnsmasq restart >/dev/null 2>&1
+    fi
+    # ЛЕЧЕНИЕ №3: sing-box не отвечает на 42
+    if ! dig +short +time=3 kino.watch @127.0.0.42 >/dev/null 2>&1; then
+      echo "$(date '+%F %T') ЛЕЧУ: sing-box не отвечает на 42 — forkop restart" >> $LOG
+      wd_restart
+    fi
+    ;;
+esac
+
+SBM=$(sing-box version 2>/dev/null | head -1 | awk '{print $3}' | cut -d. -f2)   # generator surgery only on sing-box >= 1.13
+# 3) IPv6-fakeip вернулся? (ломает браузер, возвращается после reinstall)
+AAAA=$(nslookup -type=AAAA -timeout=4 kino.watch 127.0.0.42 2>/dev/null | grep -c 'fc00')
+if [ "$AAAA" -gt 0 ] && [ "${SBM:-0}" -ge 13 ]; then
+  logger -t forkop-watchdog "🔴 IPv6-fakeip fc00 ВЕРНУЛСЯ — правлю генератор"
+  echo "$(date '+%F %T') БОЛЕЗНЬ: AAAA отдаёт fc00 ($AAAA) — правлю" >> $LOG
+  G=/usr/lib/forkop/singbox/generator.uc
+  LN=$(grep -n "inet6_range" $G 2>/dev/null | head -1 | cut -d: -f1)
+  if [ -n "$LN" ]; then
+    cp $G /root/generator.uc.wd-bak.$(date +%H%M) 2>/dev/null
+    sed -i "$((LN-1))s/, *$//" $G && sed -i "${LN}d" $G
+  fi
+  sed -i 's/, *"inet6_range": *"fc00::\/18"//' /etc/sing-box/config.json 2>/dev/null
+  wd_restart
 fi
 
-if [ ! -f /etc/podkop-fix-lists.sh ]; then
-    cat > /etc/podkop-fix-lists.sh << EOF
+# 4) конфликт /etc/dnsmasq.conf (проверка независимо от резолва)
+if grep -qE "^server=" /etc/dnsmasq.conf 2>/dev/null; then
+  logger -t forkop-watchdog "⚠️ /etc/dnsmasq.conf содержит server= — чистка"
+  sed -i "/^server=/d; /^no-resolv/d" /etc/dnsmasq.conf
+  /etc/init.d/dnsmasq restart >/dev/null 2>&1
+fi
+
+# 5) sort_by_latency (без него «Самый лучший» не выбирает узел → всё 000)
+SL=$(uci get forkop.main.sort_by_latency 2>/dev/null)
+[ "$SL" != "1" ] && { uci set forkop.main.sort_by_latency='1'; uci commit forkop; logger -t forkop-watchdog "sort_by_latency → 1"; }
+
+# 6) tproxy-модуль (без него форкоп не стартует)
+lsmod 2>/dev/null | grep -q nft_tproxy || { modprobe nft_tproxy 2>/dev/null; logger -t forkop-watchdog "nft_tproxy загружен"; }
+
+exit 0
+V7_FKWD
+put /etc/forkop-watchdog.sh /tmp/v7.fkwd 'boot grace'
+cat > /tmp/v7.hp << 'V7_HP'
 #!/bin/sh
-# Листовой скрипт — разблокировка ВЕСЬ GitHub CDN для ${VPN_TYPE} list_update
-QUIET=0
-[ "\$1" = "--cron" ] && QUIET=1
-add() {
-    if ! grep -q "\$2 \$1" \$H 2>/dev/null; then
-        echo "\$2 \$1" >> \$H
-        [ "\$QUIET" = "0" ] && echo "  + hosts: \$1 → \$2"
-    fi
+# 30-vpn v2 (02.10.2026): restart forkop when WAN comes back UP while running, but NOT during boot
+# (S99forkop already starts forkop; the boot-time restart doubled the start: 4 starts, 2-3 min to stable).
+[ "$ACTION" = "ifup" ] && [ "$INTERFACE" = "wan" ] || exit 0
+[ "$(cut -d. -f1 /proc/uptime 2>/dev/null)" -lt 150 ] && exit 0
+/etc/init.d/forkop restart >/dev/null 2>&1 &
+exit 0
+V7_HP
+put /etc/hotplug.d/iface/30-vpn /tmp/v7.hp 'uptime'
+cat > /tmp/v7.guard << 'V7_GUARD'
+#!/bin/sh
+# forkop-domain-guard.sh v3 (03.10.2026): with section 'ai' (forkop-ai-section.sh) the AI domains live ONLY in ai, never in main
+#   (v2 re-added anthropic/claude/chatgpt/openai/sora into main every hour; main's route rule precedes ai -> AI left via main exit (NL), not US2).
+# forkop-domain-guard.sh v2 (01.10.2026) — keeps required domains in place, hourly via cron:
+#   17 * * * * /etc/forkop-domain-guard.sh
+# v1 merged ALL required domains (incl. kinopub) into main. With section 'kino' present
+# (tools/forkop-kino-section.sh) that pulled kinopub back into main -> PL6 -> black screen.
+# v2: if forkop.kino exists, kinopub domains live ONLY in kino; main keeps the rest.
+# uci set as ONE string (add_list breaks fakeip). forkop is never restarted here.
+
+REQUIRED="whatsapp.com whatsapp.net whatsapp.org wa.me instagram.com cdninstagram.com fbcdn.net \
+anthropic.com claude.ai claude.com chatgpt.com openai.com sora.com \
+kino.pub kino.watch kinozor.com protorrent.org kinopub.online api.srvkp.com \
+media.service-kp.com cdn.service-kp.com cdn4t.xyz pushbr.com api.alador.space \
+api.ios-kp.store cdn2cdn.com digital-cdn.net uafix.net uakino.best \
+sharavoz.space tv.team ssiptvpro.com smart-iptv-player.com"
+
+KINO="api.alador.space api.ios-kp.store api.kino.pub api.srvkp.com cdn.service-kp.com cdn2cdn.com \
+cdn4t.xyz digital-cdn.net kino.pub kino.watch kinopub.online kinozor.com m.staticpop.net \
+media.service-kp.com protorrent.org pushbr.com s.staticpop.net service-kp.com srvkp.com \
+staticpop.net www.kino.pub"
+
+AI="openai.com chatgpt.com oaistatic.com oaiusercontent.com sora.com anthropic.com claude.ai claude.com claudeusercontent.com \
+statsig.com statsigapi.net featuregates.org featureassets.org prodregistryv2.org"
+
+norm() { printf '%s\n' $* | grep -v '^$' | sort -u | tr '\n' ' '; }
+without() { # $1=list $2=exclude
+  for d in $1; do case " $2 " in *" $d "*) ;; *) printf '%s ' "$d";; esac; done
 }
-H=/etc/hosts
-add github.com 140.82.121.4
-add api.github.com 140.82.121.6
-add codeload.github.com 140.82.121.10
-add raw.githubusercontent.com 185.199.108.133
-add raw.githubusercontent.com 185.199.109.133
-add raw.githubusercontent.com 185.199.110.133
-add raw.githubusercontent.com 185.199.111.133
-add objects.githubusercontent.com 185.199.108.133
-add release-assets.githubusercontent.com 185.199.109.133
-add github-releases.githubusercontent.com 185.199.109.154
-add github.githubassets.com 185.199.108.215
-add avatars.githubusercontent.com 185.199.110.133
-# самозапуск: если rulesets пуст → скачать списки
-SRC=\$(ls /tmp/sing-box/rulesets/*.srs 2>/dev/null | wc -l)
-if [ "\$SRC" -eq 0 ]; then
-    [ "\$QUIET" = "0" ] && echo "  ℹ️ rulesets пуст (\$SRC) — скачиваю списки..."
-    ${VPN_LIST_BIN} list_update 2>/dev/null || true
-    [ "\$QUIET" = "0" ] && echo "  ✅ списки обновлены: \$(ls /tmp/sing-box/rulesets/*.srs 2>/dev/null | wc -l) srs"
+
+if [ -f /etc/config/forkop ]; then ENG=forkop; FIELD=forkop.main.domain
+elif [ -f /etc/config/podkop ]; then ENG=podkop; FIELD=podkop.main.domain_list
+else exit 0; fi
+
+CUR=$(uci -q get $FIELD)
+[ -z "$CUR" ] && exit 0
+CHANGED=0
+
+EXCL=""
+[ "$ENG" = forkop ] && [ "$(uci -q get forkop.kino)" = "section" ] && EXCL="$KINO"
+[ "$ENG" = forkop ] && [ "$(uci -q get forkop.ai)" = "section" ] && EXCL="$EXCL $AI"
+if [ "$ENG" = forkop ] && [ -n "$EXCL" ]; then
+  NEW_MAIN=$(norm $(without "$CUR $REQUIRED" "$EXCL"))
+  if [ "$(uci -q get forkop.kino)" = "section" ]; then
+    KCUR=$(uci -q get forkop.kino.domain)
+    NEW_KINO=$(norm $KCUR $KINO)
+    if [ "$(norm $KCUR)" != "$NEW_KINO" ]; then
+      uci set forkop.kino.domain="$NEW_KINO"; CHANGED=1
+    fi
+  fi
 else
-    [ "\$QUIET" = "0" ] && echo "  ✅ rulesets на месте (\$SRC srs) — не трогаю"
+  NEW_MAIN=$(norm $CUR $REQUIRED)
 fi
-EOF
-    chmod +x /etc/podkop-fix-lists.sh
-    echo "  ✅ листовой скрипт: создан (${VPN_TYPE} → ${VPN_LIST_BIN}, ВСЕ GitHub-домены)"
-else
-    # Проверить что скрипт ссылается на правильный бинарь
-    if grep -q "$VPN_LIST_BIN" /etc/podkop-fix-lists.sh 2>/dev/null; then
-        echo "  ✅ листовой скрипт: уже правильный (${VPN_TYPE})"
-    else
-        cat > /etc/podkop-fix-lists.sh << EOF
+
+if [ "$(norm $CUR)" != "$NEW_MAIN" ]; then
+  uci set $FIELD="$NEW_MAIN"; CHANGED=1
+fi
+
+[ $CHANGED = 0 ] && exit 0
+logger -t forkop-domain-guard "domains restored (main $(echo $CUR | wc -w) -> $(echo $NEW_MAIN | wc -w))"
+uci commit $ENG
+/etc/init.d/dnsmasq restart >/dev/null 2>&1
+exit 0
+V7_GUARD
+put /etc/forkop-domain-guard.sh /tmp/v7.guard 'guard.sh v3'
+cat > /tmp/v7.fl << 'V7_FL'
 #!/bin/sh
-# Листовой скрипт — разблокировка ВЕСЬ GitHub CDN для ${VPN_TYPE} list_update
-QUIET=0
-[ "\$1" = "--cron" ] && QUIET=1
-add() {
-    if ! grep -q "\$2 \$1" \$H 2>/dev/null; then
-        echo "\$2 \$1" >> \$H
-        [ "\$QUIET" = "0" ] && echo "  + hosts: \$1 → \$2"
-    fi
-}
-H=/etc/hosts
-add github.com 140.82.121.4
-add api.github.com 140.82.121.6
-add codeload.github.com 140.82.121.10
-add raw.githubusercontent.com 185.199.108.133
-add raw.githubusercontent.com 185.199.109.133
-add raw.githubusercontent.com 185.199.110.133
-add raw.githubusercontent.com 185.199.111.133
-add objects.githubusercontent.com 185.199.108.133
-add release-assets.githubusercontent.com 185.199.109.133
-add github-releases.githubusercontent.com 185.199.109.154
-add github.githubassets.com 185.199.108.215
-add avatars.githubusercontent.com 185.199.110.133
-# самозапуск: если rulesets пуст → скачать списки
-SRC=\$(ls /tmp/sing-box/rulesets/*.srs 2>/dev/null | wc -l)
-if [ "\$SRC" -eq 0 ]; then
-    [ "\$QUIET" = "0" ] && echo "  ℹ️ rulesets пуст (\$SRC) — скачиваю списки..."
-    ${VPN_LIST_BIN} list_update 2>/dev/null || true
-    [ "\$QUIET" = "0" ] && echo "  ✅ списки обновлены: \$(ls /tmp/sing-box/rulesets/*.srs 2>/dev/null | wc -l) srs"
+# forkop-fix-lists.sh — БЕЗОПАСНОЕ обновление списков (замена 62-байтной заглушки)
+#
+# ⛔ ПРОБЛЕМА старого скрипта (62 б): он делал `forkop list_update` БЕЗ ПРОВЕРКИ.
+#    Если GitHub недоступен/отдал мусор → sing-box ВЫКИДЫВАЕТ рабочие правила
+#    → маркировка nft = 0 → трафик идёт DIRECT → кинопаб/ютуб режутся.
+#    Это и есть «сутки работает → потом ломается» (cache.db истекает).
+#
+# ✅ РЕШЕНИЕ: перед обновлением — БЭКАП правил и кэша. После обновления — ПРОВЕРКА
+#    маркировки. Если маркировка упала в 0 → ОТКАТ на бэкап + forkop reload.
+#
+# Установка: cp → /etc/forkop-fix-lists.sh; chmod +x
+# Проверка:  logread | grep fix-lists
+
+RD=/etc/forkop/rulesets
+BK=/root/forkop-lists-backup
+CACHE=/tmp/sing-box/cache.db
+
+# ── 1. Проверка: GitHub вообще доступен? ──
+GH=$(curl -sI -o /dev/null -w '%{http_code}' --max-time 10 https://github.com 2>/dev/null)
+if [ "$GH" != "200" ]; then
+    logger -t forkop-fix-lists "GitHub недоступен ($GH) — обновление ПРОПУЩЕНО (защита списков)"
+    exit 0
+fi
+
+# ── 2. БЭКАП текущих рабочих правил и кэша ──
+mkdir -p "$BK"
+cp -a "$RD"/*.srs "$BK/" 2>/dev/null
+[ -f "$CACHE" ] && cp -a "$CACHE" "$BK/cache.db.bak" 2>/dev/null
+logger -t forkop-fix-lists "бэкап сделан: $(ls "$BK"/*.srs 2>/dev/null | wc -l) .srs"
+
+# ── 3. Обновление ──
+/usr/bin/forkop list_update > /dev/null 2>&1
+sleep 8
+
+# ── 4. ПРОВЕРКА МАРКИРОВКИ: растёт ли трафик через VPN? ──
+M=$(nft list table inet ForkopTable 2>/dev/null | grep -oE 'packets [0-9]+' | awk '{print $2}' | sort -rn | head -1)
+M=${M:-0}
+
+if [ "$M" -lt 10 ]; then
+    # ⛔ маркировка мертва — ОТКАТ
+    logger -t forkop-fix-lists "⛔ маркировка упала ($M) — ОТКАТ на бэкап"
+    cp -a "$BK"/*.srs "$RD/" 2>/dev/null
+    [ -f "$BK/cache.db.bak" ] && cp -a "$BK/cache.db.bak" "$CACHE" 2>/dev/null
+    /etc/init.d/forkop restart >/dev/null 2>&1
+    sleep 20
+    M2=$(nft list table inet ForkopTable 2>/dev/null | grep -oE 'packets [0-9]+' | awk '{print $2}' | sort -rn | head -1)
+    logger -t forkop-fix-lists "откат завершён, маркировка: $M2"
 else
-    [ "\$QUIET" = "0" ] && echo "  ✅ rulesets на месте (\$SRC srs) — не трогаю"
+    logger -t forkop-fix-lists "✅ обновление ОК, маркировка: $M"
+    # ротация бэкапов: хранить последние 3
+    ls -1t "$BK"/*.srs 2>/dev/null | tail -n +100 | xargs rm -f 2>/dev/null
 fi
-EOF
-        chmod +x /etc/podkop-fix-lists.sh
-        echo "  ✅ листовой скрипт: переписан (${VPN_TYPE} → ${VPN_LIST_BIN}, ВСЕ GitHub-домены)"
+exit 0
+V7_FL
+put /etc/forkop-fix-lists.sh /tmp/v7.fl 'logger -t forkop-fix-lists'
+
+# 5.4 убрать дубли и старые имена (в бэкап)
+stash /etc/podkop-watchdog.sh
+stash /etc/podkop-fix-lists.sh
+stash /etc/hotplug.d/iface/30-forkop
+stash /etc/hotplug.d/iface/30-podkop
+stash /etc/hotplug.d/net/99-vpn-tailscale
+stash /etc/hotplug.d/net/99-forkop-tailscale
+for f in /etc/init.d/forkop.bak* /etc/init.d/*.bak /etc/init.d/forkop.orig; do [ -e "$f" ] && stash "$f"; done
+[ "$(ls /etc/rc.d 2>/dev/null | grep -ic tailscale)" -gt 0 ] && { /etc/init.d/tailscale disable 2>/dev/null; echo "  🧹 автозапуск S80tailscale снят (запуск — из rc.local; демон не трогаем)"; }
+
+# 5.5 cron: канонические строки, дубли убраны (чужие строки сохраняются)
+CUR=$(crontab -l 2>/dev/null)
+CLEAN=$(echo "$CUR" | grep -vE 'podkop-watchdog|podkop-fix-lists|ts-watchdog|forkop-watchdog|forkop-domain-guard|forkop-fix-lists' | grep -v '^$')
+NEWC="$CLEAN
+*/2 * * * * /etc/ts-watchdog.sh
+*/2 * * * * /etc/forkop-watchdog.sh
+17 * * * * /etc/forkop-domain-guard.sh
+0 * * * * /etc/forkop-fix-lists.sh --cron"
+if [ "$(echo "$CUR" | sort)" != "$(echo "$NEWC" | grep -v '^$' | sort)" ]; then
+    cp /dev/null "$BAK/crontab.before"; echo "$CUR" > "$BAK/crontab.before"
+    echo "$NEWC" | grep -v '^$' | crontab - && fixed "cron: приведён к каноническому (ts-wd и forkop-wd каждые 2 мин, guard :17, fix-lists :00)"
+else echo "  ✅ cron: уже канонический"; fi
+
+# 5.6 форкоп UCI-правки (вступят в силу после ОДНОГО forkop restart: RESTART=1)
+SBM=$(sing-box version 2>/dev/null | head -1 | awk '{print $3}' | cut -d. -f2 | grep -o '^[0-9]*'); SBM=${SBM:-0}
+for S in main kino ai stream; do
+    [ "$(uci -q get forkop.$S)" = "section" ] || continue
+    CURFA=$(uci -q get forkop.$S.filter_aaaa)
+    if [ "$SBM" -ge 13 ]; then
+        [ "$CURFA" = "1" ] || { uci set forkop.$S.filter_aaaa='1'; FK_CHANGED=1; fixed "forkop.$S.filter_aaaa=1 (sing-box 1.$SBM)"; }
+    else
+        [ -n "$CURFA" ] && { uci -q delete forkop.$S.filter_aaaa; FK_CHANGED=1; fixed "forkop.$S.filter_aaaa удалён (sing-box 1.$SBM < 1.13: иначе AAAA висят)"; }
     fi
+done
+if [ "$(uci -q get forkop.ai)" = "section" ]; then
+    FIRSTSEC=$(uci show forkop 2>/dev/null | grep -E '=section$' | head -1 | cut -d= -f1)
+    if [ "$FIRSTSEC" != "forkop.ai" ]; then uci reorder forkop.ai=0; FK_CHANGED=1; fixed "секция ai поставлена ПЕРВОЙ (правило main с Cloudflare-диапазонами больше не перехватит ИИ)"; fi
+    _MD=$(uci -q get forkop.main.domain); _ND=""
+    for _d in $_MD; do case " openai.com chatgpt.com oaistatic.com oaiusercontent.com sora.com anthropic.com claude.ai claude.com claudeusercontent.com statsig.com statsigapi.net featuregates.org featureassets.org prodregistryv2.org " in *" $_d "*) ;; *) _ND="$_ND $_d";; esac; done
+    _ND=$(echo $_ND)
+    if [ "$_ND" != "$(echo $_MD)" ]; then uci set forkop.main.domain="$_ND"; FK_CHANGED=1; fixed "main.domain: ИИ-домены убраны ($(echo $_MD | wc -w) → $(echo $_ND | wc -w))"; fi
 fi
+[ "$FK_CHANGED" = 1 ] && uci commit forkop
+else
+    warn "VPN: ${VPN_TYPE} — эталонные forkop-сторожа не ставятся. Podkop устарел: мигрировать на forkop (скилл replace-podkop-with-forkop)"
+fi
+
+# 5.7 hosts: все GitHub-CDN (forkop качает .srs через github.com → 302 → CDN)
+HF=/etc/hosts
+addh() { grep -q "$2 $1" "$HF" 2>/dev/null || echo "$2 $1" >> "$HF"; }
+addh github.com 140.82.121.4; addh api.github.com 140.82.121.6; addh codeload.github.com 140.82.121.10
+addh raw.githubusercontent.com 185.199.108.133; addh raw.githubusercontent.com 185.199.109.133
+addh raw.githubusercontent.com 185.199.110.133; addh raw.githubusercontent.com 185.199.111.133
+addh objects.githubusercontent.com 185.199.108.133; addh release-assets.githubusercontent.com 185.199.109.133
+addh github-releases.githubusercontent.com 185.199.109.154; addh github.githubassets.com 185.199.108.215
+addh avatars.githubusercontent.com 185.199.110.133
+for H in controlplane.tailscale.com derp.tailscale.com login.tailscale.com; do :; done
+echo "  ✅ hosts: GitHub-CDN на месте"
+
+# 5.8 zram-swap (подушка памяти: без неё OOM убивает sing-box/tailscaled на 233 МБ)
+if ! grep -q zram /proc/swaps 2>/dev/null; then
+    FREEKB=$(df -k /overlay 2>/dev/null | awk 'NR==2{print $4}'); FREEKB=${FREEKB:-0}
+    if [ "$FREEKB" -gt 4096 ]; then
+        if command -v apk >/dev/null 2>&1; then apk add zram-swap >/dev/null 2>&1; else opkg install zram-swap kmod-zram >/dev/null 2>&1; fi
+        /etc/init.d/zram enable 2>/dev/null; /etc/init.d/zram start 2>/dev/null; sleep 2
+        grep -q zram /proc/swaps && fixed "zram-swap: включён" || warn "zram-swap: не включился (пакет/место) — проверь вручную"
+    else warn "zram-swap: мало места на overlay ($FREEKB КБ) — пропуск"; fi
+else echo "  ✅ zram-swap: уже есть"; fi
 
 # ── 8.4. Мёртвый dhcp_option (fakeip-DNS клиентам) — ГЛАВНЫЙ корень «ничего не открывается» ─
 # 24.08.2026 (49-puzikov): dhcp_option='6,198.18.0.2' раздавал клиентам DNS 198.18.0.2,
@@ -561,101 +782,34 @@ else
     echo "  ℹ️  rebind: protection='$REBIND_P', localhost='$REBIND_L' — проверьте"
 fi
 
-# ── 8.5. Hotplug: restart VPN при WAN up ─────────────────────────────────
-mkdir -p /etc/hotplug.d/iface
 
-# Удалить старый 30-podkop если есть и заменить на универсальный
-rm -f /etc/hotplug.d/iface/30-podkop 2>/dev/null
-rm -f /etc/hotplug.d/iface/30-forkop 2>/dev/null
-
-if [ "$VPN_TYPE" != "none" ]; then
-    cat > /etc/hotplug.d/iface/30-vpn << HOTEOF
-#!/bin/sh
-# Hotplug: restart ${VPN_TYPE} при WAN up
-[ "\$ACTION" = "ifup" ] && [ "\$INTERFACE" = "wan" ] && {
-  logger -t hotplug 'WAN up — restarting ${VPN_TYPE}'
-  sleep 5
-  ${VPN_INITD} restart
-}
-HOTEOF
-    chmod +x /etc/hotplug.d/iface/30-vpn
-    echo "  ✅ hotplug 30-vpn: создан (${VPN_TYPE} → WAN up)"
-else
-    echo "  ℹ️  hotplug 30-vpn: пропущен (VPN не найден)"
-fi
-
-# ── 8.6. Hotplug: restart VPN при tailscale0 up ───────────────────────────
-mkdir -p /etc/hotplug.d/net
-
-# Удалить старые hotplug скрипты
-rm -f /etc/hotplug.d/net/99-podkop-tailscale 2>/dev/null
-rm -f /etc/hotplug.d/net/99-forkop-tailscale 2>/dev/null
-
-if [ "$VPN_TYPE" != "none" ]; then
-    cat > /etc/hotplug.d/net/99-vpn-tailscale << HOTNET
-#!/bin/sh
-# Hotplug: restart ${VPN_TYPE} после tailscale0
-[ "\$ACTION" = "add" ] || exit 0
-[ "\$INTERFACE" = "tailscale0" ] || exit 0
-(sleep 30; ${VPN_INITD} restart) &
-HOTNET
-    chmod +x /etc/hotplug.d/net/99-vpn-tailscale
-    echo "  ✅ hotplug 99-vpn-tailscale: создан (${VPN_TYPE})"
-else
-    echo "  ℹ️  hotplug 99-vpn-tailscale: пропущен (VPN не найден)"
-fi
-
-# ── 9. Cron — добавляем только отсутствующие ───────────────────────────────
-CRON_CHANGED=0
-CURRENT_CRON=$(crontab -l 2>/dev/null)
-NEW_CRON="$CURRENT_CRON"
-
-add_cron() {
-    PATTERN="$1"; ENTRY="$2"
-    if ! echo "$CURRENT_CRON" | grep -q "$PATTERN"; then
-        NEW_CRON="$NEW_CRON
-$ENTRY"
-        CRON_CHANGED=1
-        echo "  ✅ cron добавлен: $ENTRY"
-    else
-        echo "  ✅ cron уже есть: $PATTERN"
-    fi
-}
-
-# Удалить stale cron entries (бинари которых не существует)
-if [ -n "$CURRENT_CRON" ]; then
-    CLEANED_CRON=""
-    echo "$CURRENT_CRON" | while IFS= read -r line; do
-        # Пропустить пустые строки
-        [ -z "$line" ] && continue
-        # Проверить бинарь в cron строке
-        CRON_BIN=$(echo "$line" | grep -oE '/usr/bin/[a-z]+' | head -1)
-        if [ -n "$CRON_BIN" ] && [ ! -f "$CRON_BIN" ]; then
-            echo "  🧹 cron удалён (бинарь не найден): $line"
-            continue
+# ── 9.0. ИТОГ ЭТАЛОНА 03.10: выход ИИ + опциональный ОДИН рестарт форкопа ─────────────
+if [ "$VPN_TYPE" = "forkop" ]; then
+    HAS_AI=0; [ "$(uci -q get forkop.ai)" = "section" ] && HAS_AI=1
+    HAS_KINO=0; [ "$(uci -q get forkop.kino)" = "section" ] && HAS_KINO=1
+    UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36'
+    aix() { curl -s -m 10 -A "$UA" https://claude.ai/cdn-cgi/trace 2>/dev/null | grep -E '^loc=' | cut -d= -f2; }
+    AIX=""; MNX=""
+    [ "$(/etc/init.d/forkop status 2>&1 | head -1)" = "running" ] && { AIX=$(aix); MNX=$(curl -s -m 10 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^loc=' | cut -d= -f2); }
+    # рестарт нужен, если записаны новые правки ИЛИ секция ai есть, а выход ИИ ещё не US (правки прошлого запуска не применены)
+    NEEDRST=0; [ "$FK_CHANGED" = 1 ] && NEEDRST=1; [ "$HAS_AI" = 1 ] && [ "$AIX" != "US" ] && NEEDRST=1
+    if [ "$NEEDRST" = 1 ]; then
+        if [ "$RESTART" = "1" ]; then
+            echo "  ⏳ RESTART=1: один forkop restart (20 с)..."; /etc/init.d/forkop restart >/dev/null 2>&1; sleep 20
+            echo "  ✅ forkop после рестарта: $(/etc/init.d/forkop status 2>&1 | head -1)"; echo "forkop: ОДИН рестарт выполнен (RESTART=1)" >> /tmp/v7.fixed
+            AIX=$(aix); MNX=$(curl -s -m 10 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^loc=' | cut -d= -f2)
+        else
+            echo "  ℹ️  forkop-правки записаны/ждут применения (безопасный режим — без рестарта). Применить ОДНИМ рестартом:"
+            echo "       RESTART=1 sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)   или   /etc/init.d/forkop restart"
         fi
-        echo "$line"
-    done > /tmp/cron-cleaned
-    CLEANED=$(cat /tmp/cron-cleaned)
-    rm -f /tmp/cron-cleaned
-    if [ "$CLEANED" != "$CURRENT_CRON" ]; then
-        CURRENT_CRON="$CLEANED"
-        NEW_CRON="$CLEANED"
-        CRON_CHANGED=1
     fi
-fi
-
-add_cron "ts-watchdog"        "* * * * * /etc/ts-watchdog.sh"
-add_cron "podkop-watchdog"    "*/2 * * * * /etc/podkop-watchdog.sh"
-add_cron "podkop-fix-lists"   "0 * * * * /etc/podkop-fix-lists.sh --cron"
-
-# VPN list_update — только если бинарь существует
-if [ -n "$VPN_BIN" ] && [ -f "$VPN_BIN" ]; then
-    add_cron "${VPN_TYPE} list_update" "13 */3 * * * ${VPN_BIN} list_update"
-fi
-
-if [ "$CRON_CHANGED" = "1" ]; then
-    echo "$NEW_CRON" | grep -v "^$" | crontab -
+    echo "  ℹ️  выход ИИ (claude.ai по Cloudflare): ${AIX:-?}   выход main: ${MNX:-?}"
+    if [ "$HAS_AI" = 1 ] && [ "$AIX" = "US" ] && [ "$AIX" != "$MNX" ]; then echo "  ✅ ИИ идёт через США"
+    elif [ "$HAS_AI" = 1 ] && [ "$NEEDRST" = 1 ] && [ "$RESTART" != "1" ]; then warn "ИИ пока идёт как раньше (${AIX:-?}) — нужен рестарт форкопа (RESTART=1)"
+    elif [ "$HAS_AI" = 1 ]; then warn "секция ai есть, но выход ИИ не US (${AIX:-?}) — проверь подписку ai (us2) и порядок секций"
+    else warn "секции ai НЕТ: ChatGPT/Claude идут через выход main (${MNX:-?}) — Cloudflare его блокирует (Sorry, you have been blocked)"; fi
+    [ "$HAS_AI" = 0 ] && warn "добавить секцию ai (США; нужны подписки владельца): с Mac  forkop-repair-run.sh forkop-ai-section.sh  (скилл replace-podkop-with-forkop)"
+    [ "$HAS_KINO" = 0 ] && warn "добавить секцию kino (кинопаб → kino.watch): с Mac  forkop-repair-run.sh  (скилл replace-podkop-with-forkop)"
 fi
 
 # ── 9.5. crond — запустить если не работает ────────────────────────────────
@@ -782,6 +936,15 @@ fi
 # ── 10. Итог ───────────────────────────────────────────────────────────────
 echo ""
 echo "═══════════════════════════════════════════"
+
+snapshot "СОСТОЯНИЕ ПОСЛЕ"
+echo ""
+echo "  ┌── ИСПРАВЛЕНО В ЭТОМ ЗАПУСКЕ ─────────────────────────────"
+if [ -s /tmp/v7.fixed ]; then sed 's/^/  │ ✅ /' /tmp/v7.fixed; else echo "  │ ничего — всё уже по эталону"; fi
+echo "  ├── НЕДОЧЁТЫ (нужны руки/решение) ───────────────────────────"
+if [ -s /tmp/v7.issues ]; then sed 's/^/  │ ⚠️  /' /tmp/v7.issues; else echo "  │ нет"; fi
+echo "  └──────────────────────────────────────────────────────────"
+echo "  📁 бэкапы заменённого: $BAK"
 echo "  ИТОГ ($(date '+%H:%M:%S')):"
 echo "  hostname:    $HOSTNAME_VAL"
 echo "  OpenWrt:     $OPENWRT_VER"
@@ -794,11 +957,11 @@ echo "  init.d:      $([ -f /etc/init.d/tailscale ] && (/etc/init.d/tailscale en
 echo "  rc.local:    $(grep -q tailscaled /etc/rc.local && echo OK || echo MISSING)"
 echo "  rc.local.bak: $(ls /etc/rc.local.bak >/dev/null 2>&1 && echo OK || echo MISSING)"
 echo "  ts-watchdog: $(crontab -l 2>/dev/null | grep -c ts-watchdog) cron"
-echo "  vpn-watchdog:$(crontab -l 2>/dev/null | grep -c podkop-watchdog) cron"
-echo "  fix-lists:   $(crontab -l 2>/dev/null | grep -c podkop-fix-lists) cron"
+echo "  vpn-watchdog:$(crontab -l 2>/dev/null | grep -cE "forkop-watchdog|podkop-watchdog") cron"
+echo "  fix-lists:   $(crontab -l 2>/dev/null | grep -cE "forkop-fix-lists|podkop-fix-lists") cron"
 echo "  gh-mirror:   $(grep -q GITHUB_RAW_URL /etc/init.d/forkop 2>/dev/null && echo OK || echo NONE)"
 echo "  hotplug WAN: $(ls /etc/hotplug.d/iface/30-vpn >/dev/null 2>&1 && echo OK || echo MISSING)"
-echo "  hotplug TS:  $(ls /etc/hotplug.d/net/99-vpn-tailscale >/dev/null 2>&1 && echo OK || echo MISSING)"
+echo "  guard v3:    $(grep -c 'guard.sh v3' /etc/forkop-domain-guard.sh 2>/dev/null || echo 0)   ts-wd: $(grep -o 'ts-watchdog v6\.[0-9]' /etc/ts-watchdog.sh 2>/dev/null | head -1)   zram: $(grep -c zram /proc/swaps 2>/dev/null)"
 echo "  crond:       $(pgrep crond >/dev/null 2>&1 && echo running || echo NOT running)"
 echo "  state:       $(wc -c < "${TS_STATEDIR}tailscaled.state" 2>/dev/null || echo 0) байт"
 echo "  backup:      $(wc -c < /root/tailscaled.state.backup 2>/dev/null || echo 0) байт"
@@ -811,6 +974,6 @@ echo ""
 if [ "$WARNINGS" -gt 0 ]; then
     echo "  ⚠️  Предупреждений: $WARNINGS — см. выше"
 else
-    echo "  ✅ Всё готово. Настройки применятся после: reboot"
+    echo "  ✅ Готово. Ребут НЕ нужен. Файлы эталона применены; forkop-правки конфига — RESTART=1 (один рестарт) или /etc/init.d/forkop restart."
 fi
 echo ""

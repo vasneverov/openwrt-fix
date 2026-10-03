@@ -2,7 +2,7 @@
 # OpenWrt Router Config Fix — Universal Rescue Script
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
-# v7.2 — 2026-10-03  «ЭТАЛОН 03.10» + ЩИТ TAILSCALE (всё, что накоплено с 07.09 по 03.10.2026)
+# v7.3 — 2026-10-03  «ЭТАЛОН 03.10» + ЩИТ TAILSCALE (v7.3: `opkg update`/`apk update` перед установкой zram — без него на opkg-роутерах zram не ставился) (всё, что накоплено с 07.09 по 03.10.2026)
 #   Принцип: файлы эталона ставятся ТОЛЬКО если установленная версия СТАРШЕ (новее/равное не трогаем,
 #   бэкап заменённого — /root/rescue-v7-<дата>/). Без перезапусков сервисов и без ребута.
 #   Для вступления форкоп-правок в силу: RESTART=1 sh <(wget ...)  → ОДИН forkop restart в конце.
@@ -35,7 +35,7 @@ HOSTNAME_VAL=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   OpenWrt Config Fix v7.2 — 2026-10-03              ║"
+echo "║   OpenWrt Config Fix v7.3 — 2026-10-03              ║"
 printf "║   Роутер: %-43s║\n" "$HOSTNAME_VAL"
 echo "║   Режим: БЕЗОПАСНЫЙ (без перезапусков)              ║"
 echo "╚══════════════════════════════════════════════════════╝"
@@ -234,7 +234,7 @@ else
     echo "  ✅ tailscale AutoUpdate: Check:false (уже)"
 fi
 
-# ── 4. init.d/tailscale: НЕ отключаем здесь (v7.2, железное №1) ───────────────────────────
+# ── 4. init.d/tailscale: НЕ отключаем здесь (v7.3, железное №1) ───────────────────────────
 #   Автозапуск init.d снимается ТОЛЬКО в 5.1 и ТОЛЬКО если в rc.local есть настоящая строка запуска tailscaled
 #   (иначе после перезагрузки Tailscale не поднимется). Ребут-тест на удалённых запрещён — способ запуска не меняем вслепую.
 if [ -f /etc/init.d/tailscale ]; then
@@ -309,7 +309,7 @@ stash() { # stash FILE — убрать лишний файл в бэкап (н�
     mv "$1" "$BAK/$(echo "$1" | tr / _).removed" 2>/dev/null && fixed "убран дубль: $1 (в $BAK)"
 }
 
-# 5.1 rc.local — ТОЧЕЧНО, правка считается сделанной ТОЛЬКО если файл реально изменился (v7.2)
+# 5.1 rc.local — ТОЧЕЧНО, правка считается сделанной ТОЛЬКО если файл реально изменился (v7.3)
 RC=${V7_RC:-/etc/rc.local}
 HN=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 HN=$(echo "$HN" | tr '_' '-' | tr 'A-Z' 'a-z')
@@ -330,7 +330,7 @@ rc_fix() {
         fi
         # ни rc.local, ни init.d не запускают Tailscale → добавляем эталонный блок перед первым exit 0; чужие строки сохраняются
         cat > /tmp/rc.blk << RCEOF
-# --- Tailscale (v7.2, эталон: userspace, oom -900, autoupdate off, hostname без "_") ---
+# --- Tailscale (v7.3, эталон: userspace, oom -900, autoupdate off, hostname без "_") ---
 touch /tmp/rc-local-running
 (
 for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -779,7 +779,7 @@ echo "  ✅ hosts: GitHub-CDN на месте"
 if ! grep -q zram /proc/swaps 2>/dev/null; then
     FREEKB=$(df -k /overlay 2>/dev/null | awk 'NR==2{print $4}'); FREEKB=${FREEKB:-0}
     if [ "$FREEKB" -gt 4096 ]; then
-        if command -v apk >/dev/null 2>&1; then apk add zram-swap >/dev/null 2>&1; else opkg install zram-swap kmod-zram >/dev/null 2>&1; fi
+        if command -v apk >/dev/null 2>&1; then apk update >/dev/null 2>&1; apk add zram-swap >/dev/null 2>&1; else opkg update >/dev/null 2>&1; opkg install zram-swap kmod-zram >/dev/null 2>&1; fi
         /etc/init.d/zram enable 2>/dev/null; /etc/init.d/zram start 2>/dev/null; sleep 2
         grep -q zram /proc/swaps && fixed "zram-swap: включён" || warn "zram-swap: не включился (пакет/место) — проверь вручную"
     else warn "zram-swap: мало места на overlay ($FREEKB КБ) — пропуск"; fi

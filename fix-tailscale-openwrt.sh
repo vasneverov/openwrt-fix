@@ -2,6 +2,7 @@
 # OpenWrt Router Config Fix — Universal Rescue Script
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
+# v7.5 — 2026-10-08: +5.9 «часы при загрузке» (P1 NTP по IP, P2 hotplug ntp 30-ts-sync, P3 rc.local ждёт NTP) — Tailscale на загрузке Running ~24 с вместо ~107 с (s78-39-karpin).
 # v7.4 — 2026-10-03  «ЭТАЛОН 03.10» + ЩИТ TAILSCALE (v7.4: `opkg update`/`apk update` перед установкой zram — без него на opkg-роутерах zram не ставился) (всё, что накоплено с 07.09 по 03.10.2026)
 #   Принцип: файлы эталона ставятся ТОЛЬКО если установленная версия СТАРШЕ (новее/равное не трогаем,
 #   бэкап заменённого — /root/rescue-v7-<дата>/). Без перезапусков сервисов и без ребута.
@@ -755,7 +756,7 @@ done
 if [ "$(uci -q get forkop.ai)" = "section" ]; then
     FIRSTSEC=$(uci show forkop 2>/dev/null | grep -E '=section$' | head -1 | cut -d= -f1)
     if [ "$FIRSTSEC" != "forkop.ai" ]; then uci reorder forkop.ai=0; FK_CHANGED=1; fixed "секция ai поставлена ПЕРВОЙ (правило main с Cloudflare-диапазонами больше не перехватит ИИ)"; fi
-    _MD=$(uci -q get forkop.main.domain); _ND=""
+    _MD=$(uci -q get forkop.main.domain | tr -d "\047\042"); _ND=""   # 07.10.2026: strip quotes (a one-element uci list prints as 'a b c' -> literal quotes broke the forkop validator, z56-55-murashkin)
     for _d in $_MD; do case " openai.com chatgpt.com oaistatic.com oaiusercontent.com sora.com anthropic.com claude.ai claude.com claudeusercontent.com statsig.com statsigapi.net featuregates.org featureassets.org prodregistryv2.org " in *" $_d "*) ;; *) _ND="$_ND $_d";; esac; done
     _ND=$(echo $_ND)
     if [ "$_ND" != "$(echo $_MD)" ]; then uci set forkop.main.domain="$_ND"; FK_CHANGED=1; fixed "main.domain: ИИ-домены убраны ($(echo $_MD | wc -w) → $(echo $_ND | wc -w))"; fi
@@ -778,6 +779,9 @@ for H in controlplane.tailscale.com derp.tailscale.com login.tailscale.com; do :
 echo "  ✅ hosts: GitHub-CDN на месте"
 
 # 5.8 zram-swap (подушка памяти: без неё OOM убивает sing-box/tailscaled на 233 МБ)
+# 07.10.2026 (механизм memory, эталон MEMORY-ZRAM-SWAP-MECHANISM-2026-10-07.md): если zram ЕСТЬ,
+# но размером по дефолту (ram/2048) — увеличить до 256 МБ + алгоритм zstd (сжатие ~3× вместо lzo 2.2×)
+# + vm.overcommit_memory=1 (не даёт ядру убивать sing-box при всплеске). TS не трогаем, ребута нет.
 if ! grep -q zram /proc/swaps 2>/dev/null; then
     FREEKB=$(df -k /overlay 2>/dev/null | awk 'NR==2{print $4}'); FREEKB=${FREEKB:-0}
     if [ "$FREEKB" -gt 4096 ]; then
@@ -786,6 +790,106 @@ if ! grep -q zram /proc/swaps 2>/dev/null; then
         grep -q zram /proc/swaps && fixed "zram-swap: включён" || warn "zram-swap: не включился (пакет/место) — проверь вручную"
     else warn "zram-swap: мало места на overlay ($FREEKB КБ) — пропуск"; fi
 else echo "  ✅ zram-swap: уже есть"; fi
+# 5.8b РАЗМЕР zram + алгоритм + overcommit (07.10.2026): дефолт ram/2048 мал при 3 секциях → OOM.
+_ZSZ=$(uci -q get system.@system[0].zram_size_mb); _ZAL=$(uci -q get system.@system[0].zram_comp_algo)
+if grep -q zram /proc/swaps 2>/dev/null; then
+    if [ -z "$_ZSZ" ] || [ "$_ZSZ" -lt 256 ] 2>/dev/null; then
+        cp /etc/config/system /root/system.bak-zram-$(date +%s) 2>/dev/null
+        uci set system.@system[0].zram_size_mb='256'
+        case "$(cat /sys/block/zram0/comp_algorithm 2>/dev/null)" in *zstd*) uci set system.@system[0].zram_comp_algo='zstd';; esac
+        uci commit system
+        swapoff /dev/zram0 2>/dev/null; /etc/init.d/zram stop 2>/dev/null; sleep 1; echo 1 > /sys/block/zram0/reset 2>/dev/null; sleep 1; /etc/init.d/zram start 2>/dev/null; sleep 3
+        fixed "zram: размер $(cat /sys/block/zram0/disksize 2>/dev/null | awk '{print int($1/1048576)}') МБ, algo $(cat /sys/block/zram0/comp_algorithm 2>/dev/null | tr ' ' '\n' | grep '[' | tr -d '[]')"
+    else echo "  ✅ zram размер задан: ${_ZSZ} МБ"; fi
+fi
+if [ "$(cat /proc/sys/vm/overcommit_memory 2>/dev/null)" != "1" ]; then
+    echo 1 > /proc/sys/vm/overcommit_memory 2>/dev/null
+    printf 'vm.overcommit_memory=1\n' > /etc/sysctl.d/99-forkop-mem.conf 2>/dev/null
+    fixed "vm.overcommit_memory=1 (+/etc/sysctl.d/99-forkop-mem.conf)"
+else echo "  ✅ vm.overcommit_memory=1"; fi
+
+# 5.9 ЧАСЫ ПРИ ЗАГРУЗКЕ (08.10.2026, s78-39-karpin: Tailscale Running 107 с → ~24 с): P1 NTP по IP, P2 hotplug ntp 30-ts-sync, P3 rc.local ждёт NTP.
+#     Только файлы/uci, без перезапуска Tailscale/форкопа/сети; вступает при следующей загрузке. Подробно: references/TAILSCALE-ETALON-HELPERS-AND-BOOT-CLOCK-2026-10-08.md
+cat > /tmp/ts-boot-clock-fix.sh <<'TSBCF_EOF'
+#!/bin/sh
+# ts-boot-clock-fix.sh [--check] — лечение «нестабильного старта Tailscale из-за часов» (08.10.2026, проверено на s78-39-karpin: TS Running 107 с → ~24–35 с).
+# Запуск на роутере:  ssh root@R 'sh -s -- --check' < ts-boot-clock-fix.sh    (чтение)     ·    ssh root@R 'sh -s' < ts-boot-clock-fix.sh   (применить)
+# Причина: у роутера нет RTC, sysfixtime ставит часы на mtime самого свежего файла /etc, rc.local стартует tailscaled до WAN/NTP → NoState до сторожа.
+# Что делает (идемпотентно, файлами, БЕЗ перезапуска Tailscale/форкопа/сети, с бэкапом, sh -n до замены, щит TS до/после):
+#   P1  NTP-серверы по IP первыми (162.159.200.1, 216.239.35.0), пул — запасной (вступает при следующей загрузке);
+#   P2  /etc/hotplug.d/ntp/30-ts-sync — по событию ntpd (step/stratum): метка /tmp/ntp-synced + пинок ts-watchdog, если TS не Running;
+#   P3  rc.local: перед запуском tailscaled ждать метку до 100 с (в фоне: если блок rc.local не в подпроцессе — оборачиваю, чтобы не задерживать S99forkop).
+# Известные формы rc.local: (a) эталон v7.4 — блок в «( … ) &» с «mkdir -p /var/run/tailscale»; (b) legacy v5.2 — те же строки без подпроцесса, заканчиваются
+#   «logger -t rc.local 'Tailscale started'». Прочие формы НЕ трогаю (пишу «править вручную»). Переменные для тестов: RC=путь, HP_DIR=каталог hotplug.
+MODE=${1:-apply}; RC=${RC:-/etc/rc.local}; HP_DIR=${HP_DIR:-/etc/hotplug.d/ntp}; DRYUCI=${DRYUCI:-0}
+p1() { [ "$(uci -q get system.ntp.server 2>/dev/null | awk '{print ($1 ~ /^[0-9][0-9.]*$/)?1:0}')" = 1 ]; }
+p2() { [ -x "$HP_DIR/30-ts-sync" ]; }
+p3() { grep -q 'ntp-synced' "$RC" 2>/dev/null; }
+TSP() { for d in /proc/[0-9]*; do [ "$(cat $d/comm 2>/dev/null)" = tailscaled ] && basename $d; done | tr '\n' ' '; }
+shield() { echo "  щит $1: tailscaled=[$(TSP)] Running=$(tailscale status --json 2>/dev/null | grep -c '"BackendState": "Running"') sing-box=$(pgrep sing-box | head -1)"; }
+echo "ts-boot-clock-fix: P1 NTP по IP=$(p1 && echo есть || echo НЕТ)  P2 hotplug=$(p2 && echo есть || echo НЕТ)  P3 rc.local-ожидание=$(p3 && echo есть || echo НЕТ)"
+[ "$MODE" = "--check" ] && { p1 && p2 && p3 && echo "ИТОГ: всё применено" || echo "ИТОГ: нужно применить (запусти без --check)"; exit 0; }
+[ "$(TSP | wc -w)" -le 1 ] || { echo "⛔ несколько tailscaled — сначала разобраться"; exit 2; }
+BK=/root/ts-clock-$(date +%Y%m%d_%H%M%S); mkdir -p $BK; cp -p "$RC" /etc/rc.local.bak /etc/config/system $BK/ 2>/dev/null; echo "  бэкап: $BK"; shield ДО
+# ── P1
+if ! p1; then
+  OLD=$(uci -q get system.ntp.server); uci -q delete system.ntp.server
+  for s in 162.159.200.1 216.239.35.0; do uci add_list system.ntp.server="$s"; done
+  for s in $OLD; do case "$s" in 162.159.200.1|216.239.35.0) ;; *) uci add_list system.ntp.server="$s";; esac; done
+  [ -z "$OLD" ] && for s in 0.openwrt.pool.ntp.org 1.openwrt.pool.ntp.org; do uci add_list system.ntp.server="$s"; done
+  uci commit system; echo "  P1 ✅ NTP: $(uci get system.ntp.server | tr '\n' ' ')"
+else echo "  P1 уже есть"; fi
+# ── P2
+if ! p2; then
+  mkdir -p "$HP_DIR"; cat > "$HP_DIR/30-ts-sync" <<'EOF'
+#!/bin/sh
+# 30-ts-sync (08.10.2026, P2): событие ntpd (step/stratum) = часы синхронизированы.
+# 1) метка /tmp/ntp-synced (её ждёт rc.local перед стартом Tailscale);
+# 2) если Tailscale не Running (стартовал при отстающих часах) — сразу вызвать ts-watchdog, не ждать cron.
+case "$ACTION" in step|stratum) ;; *) exit 0;; esac
+touch /tmp/ntp-synced
+logger -t ts-sync "ntp $ACTION: время синхронизировано"
+(
+  U=$(cut -d. -f1 /proc/uptime); [ "$U" -lt 92 ] && sleep $((92-U))   # у ts-watchdog грейс 90 с после загрузки
+  BS=$(tailscale status --json 2>/dev/null | grep -m1 BackendState | cut -d'"' -f4)
+  [ "$BS" = "Running" ] || { logger -t ts-sync "Tailscale=$BS после NTP — запускаю ts-watchdog"; /etc/ts-watchdog.sh; }
+) >/dev/null 2>&1 &
+exit 0
+EOF
+  chmod +x "$HP_DIR/30-ts-sync"; sh -n "$HP_DIR/30-ts-sync" && echo "  P2 ✅ hotplug: $HP_DIR/30-ts-sync" || echo "  P2 ⛔ синтаксис hotplug"
+else echo "  P2 уже есть"; fi
+# ── P3
+if ! p3; then
+  N=$(grep -nE '^[^#]*tailscaled[[:space:]].*--(state|statedir|tun)' "$RC" | head -1 | cut -d: -f1)
+  if [ -z "$N" ]; then echo "  P3 ⚠️ в $RC нет запуска tailscaled (запуск через init.d?) — править вручную"
+  else
+    M=$(grep -n '^mkdir -p /var/run/tailscale' "$RC" | head -1 | cut -d: -f1); S=${M:-$N}; [ "$S" -gt "$N" ] && S=$N
+    SUB=$(awk -v n="$S" 'NR<n && ($0=="(" || $0 ~ /^\([[:space:]]*#/){f=1} END{print f+0}' "$RC")   # есть ли «(» до блока → уже в подпроцессе
+    cp "$RC" /tmp/rc.fix
+    if [ "$SUB" = 1 ]; then
+      awk -v n="$S" 'NR==n{print "# 08.10.2026 P3: ждать NTP до 100 с перед запуском TS (часы отстают после ребута → NoState)"; print "i=0; while [ ! -f /tmp/ntp-synced ] && [ $i -lt 50 ]; do sleep 2; i=$((i+1)); done"; print "logger -t rc.local \"ntp-wait: $((i*2)) с, synced=$([ -f /tmp/ntp-synced ] && echo yes || echo no)\""} {print}' "$RC" > /tmp/rc.fix
+      FORM="(a) уже в подпроцессе"
+    else
+      E=$(grep -n "logger -t rc.local 'Tailscale started'" "$RC" | head -1 | cut -d: -f1)
+      if [ -z "$E" ]; then echo "  P3 ⚠️ неизвестная форма rc.local (нет «Tailscale started») — править вручную"; rm -f /tmp/rc.fix; E=""; fi
+      if [ -n "$E" ]; then
+        awk -v s="$S" -v e="$E" 'NR==s{print "("; print "# 08.10.2026 P3: ждать NTP до 100 с перед запуском TS; в подпроцессе, чтобы не задерживать S99forkop"; print "i=0; while [ ! -f /tmp/ntp-synced ] && [ $i -lt 50 ]; do sleep 2; i=$((i+1)); done"; print "logger -t rc.local \"ntp-wait: $((i*2)) с, synced=$([ -f /tmp/ntp-synced ] && echo yes || echo no)\""} {print} NR==e{print ") &"}' "$RC" > /tmp/rc.fix
+        FORM="(b) legacy — обёрнуто в подпроцесс"
+      fi
+    fi
+    if [ -s /tmp/rc.fix ]; then
+      if sh -n /tmp/rc.fix && grep -q 'ntp-synced' /tmp/rc.fix && grep -q 'tailscaled' /tmp/rc.fix; then cp /tmp/rc.fix "$RC.n" && chmod +x "$RC.n" && mv "$RC.n" "$RC" && [ "$RC" = /etc/rc.local ] && cp -p "$RC" /etc/rc.local.bak; echo "  P3 ✅ rc.local: $FORM; sh -n ok; bak==rc: $(cmp -s "$RC" /etc/rc.local.bak && echo да || echo НЕТ)"
+      else echo "  P3 ⛔ проверка нового rc.local не прошла — НЕ тронут"; fi
+    fi
+  fi
+else echo "  P3 уже есть"; fi
+shield ПОСЛЕ
+echo "ИТОГ: P1=$(p1 && echo ок || echo НЕТ) P2=$(p2 && echo ок || echo НЕТ) P3=$(p3 && echo ок || echo НЕТ) (вступает при следующей загрузке; Tailscale/форкоп не перезапускались)"
+TSBCF_EOF
+_CLK=$(sh /tmp/ts-boot-clock-fix.sh 2>&1); rm -f /tmp/ts-boot-clock-fix.sh
+echo "$_CLK" | grep -E "P[123]|ИТОГ" | sed 's/^/  /'
+echo "$_CLK" | grep -q "✅" && echo "часы при загрузке (P1–P3): применено" >> /tmp/v7.fixed
+echo "$_CLK" | grep -q "⚠️\|⛔" && warn "часы при загрузке: нестандартный rc.local — править вручную (см. ts-boot-clock-fix.sh)"
 
 # ── 8.4. Мёртвый dhcp_option (fakeip-DNS клиентам) — ГЛАВНЫЙ корень «ничего не открывается» ─
 # 24.08.2026 (49-puzikov): dhcp_option='6,198.18.0.2' раздавал клиентам DNS 198.18.0.2,
@@ -889,6 +993,8 @@ uci set system.@system[0].timezone='MSK-3' 2>/dev/null
 uci set system.@system[0].zonename='Europe/Moscow' 2>/dev/null
 uci set system.ntp=timeserver 2>/dev/null
 uci delete system.ntp.server 2>/dev/null
+uci add_list system.ntp.server='162.159.200.1' 2>/dev/null   # 08.10.2026 P1: NTP по IP первыми (без ожидания DNS), пул — запасной
+uci add_list system.ntp.server='216.239.35.0' 2>/dev/null
 uci add_list system.ntp.server='0.openwrt.pool.ntp.org' 2>/dev/null
 uci add_list system.ntp.server='1.openwrt.pool.ntp.org' 2>/dev/null
 uci add_list system.ntp.server='2.openwrt.pool.ntp.org' 2>/dev/null

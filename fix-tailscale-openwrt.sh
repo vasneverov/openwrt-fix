@@ -2,6 +2,11 @@
 # OpenWrt Router Config Fix — Universal Rescue Script
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
+# v7.6 — 2026-10-09: +3.8 БЕЗОПАСНОСТЬ ДОСТУПА (dropbear MaxAuthTries 3→6 + IdleTimeout 120 — бан на 3 опечатках
+#        вырубал SSH/LuCI; нашёл при ночном разборе z56-68: «SSH и LuCI пропали и вернулись сами»);
+#        +5.95 ЧИСТКА СЛЕДОВ (мои диагностические .log/w*.sh из /tmp, cron w*.sh — иначе диагностика копится);
+#        +ПРОВЕРКА: недопустимый nft-перехват DNS на LAN (redirect :53/iifname br-lan) — рубит LuCI/rpcd.
+#        ⚠️ СТОП-ФАКТ: НЕ импровизировать nft-перехват DNS + DoT/DoH-отказ (убивает доступ; QUIC-блок — ок).
 # v7.5 — 2026-10-08: +5.9 «часы при загрузке» (P1 NTP по IP, P2 hotplug ntp 30-ts-sync, P3 rc.local ждёт NTP) — Tailscale на загрузке Running ~24 с вместо ~107 с (s78-39-karpin).
 # v7.4 — 2026-10-03  «ЭТАЛОН 03.10» + ЩИТ TAILSCALE (v7.4: `opkg update`/`apk update` перед установкой zram — без него на opkg-роутерах zram не ставился) (всё, что накоплено с 07.09 по 03.10.2026)
 #   Принцип: файлы эталона ставятся ТОЛЬКО если установленная версия СТАРШЕ (новее/равное не трогаем,
@@ -36,7 +41,7 @@ HOSTNAME_VAL=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   OpenWrt Config Fix v7.4 — 2026-10-03              ║"
+echo "║   OpenWrt Config Fix v7.6 — 2026-10-09              ║"
 printf "║   Роутер: %-43s║\n" "$HOSTNAME_VAL"
 echo "║   Режим: БЕЗОПАСНЫЙ (без перезапусков)              ║"
 echo "╚══════════════════════════════════════════════════════╝"
@@ -235,6 +240,26 @@ if [ "$AUC" != "false" ]; then
     echo "  ✅ tailscale AutoUpdate: выключен (Check:false)"
 else
     echo "  ✅ tailscale AutoUpdate: Check:false (уже)"
+fi
+
+# ── 3.8. БЕЗОПАСНОСТЬ ДОСТУПА: dropbear MaxAuthTries 3→6 + IdleTimeout 120 (09.10.2026, z56-68) ──
+#   Причина «SSH и LuCI пропали и вернулись сами»: dropbear рубит соединение на 3-й неудачной попытке
+#   («Max auth tries reached»). При плотной работе/медленном пути (DERP-релей) заходы обрывались на 3 фейлах
+#   → доступ пропадал на 20-30с. Ставим 6 попыток и IdleTimeout 120 (сессия не рвётся). Идемпотентно.
+if [ -f /etc/config/dropbear ] && uci -q show dropbear.main >/dev/null 2>&1; then
+    _mt=$(uci -q get dropbear.main.MaxAuthTries); _it=$(uci -q get dropbear.main.IdleTimeout)
+    if [ "$_mt" != "6" ] || [ "$_it" != "120" ]; then
+        uci set dropbear.main.MaxAuthTries='6' 2>/dev/null
+        uci set dropbear.main.IdleTimeout='120' 2>/dev/null
+        uci commit dropbear 2>/dev/null
+        /etc/init.d/dropbear restart >/dev/null 2>&1
+        _i=0; while [ $_i -lt 10 ]; do _i=$((_i+1)); nc -z -w2 127.0.0.1 22 2>/dev/null && break; done
+        fixed "dropbear: MaxAuthTries=6, IdleTimeout=120 (бан на 3 опечатках больше не вырубит SSH/LuCI)"
+    else
+        echo "  ✅ dropbear: MaxAuthTries=6, IdleTimeout=120 (уже эталон)"
+    fi
+else
+    echo "  ℹ️  dropbear UCI не найден — пропущено"
 fi
 
 # ── 4. init.d/tailscale: НЕ отключаем здесь (v7.4, железное №1) ───────────────────────────
@@ -1082,6 +1107,26 @@ if [ -f /usr/bin/forkop ]; then
             echo "  ✅ DNS: UDP 53 работает — DoH не нужен"
         fi
     fi
+fi
+
+# ── 5.95. ЧИСТКА СЛЕДОВ + ПРОВЕРКА ОПАСНЫХ ПРАВОК (09.10.2026, z56-68) ─────────────
+#   Диагностика копится на роутере: .log/.sh из /tmp, cron-строки w*.sh. Убираем ТОЛЬКО свой мусор,
+#   полезные бэкапы в /root НЕ трогаем. Плюс проверка: не остался ли недопустимый nft-перехват DNS
+#   (redirect :53 / iifname br-lan) — он рубит LuCI/rpcd (наш урок ночи 09.10).
+echo "  ── 5.95. Чистка следов + проверка опасных правок ──"
+for _f in /tmp/w.log /tmp/w2.log /tmp/w3.log /tmp/ts.log /tmp/repair.log /tmp/repair-restart.log /tmp/w.sh /tmp/w2.sh /tmp/w3.sh; do
+    [ -e "$_f" ] && { rm -f "$_f" && fixed "убран диагностический след: $_f"; }
+done
+if crontab -l 2>/dev/null | grep -qE '/tmp/w[0-9]*\.sh'; then
+    crontab -l 2>/dev/null | grep -vE '/tmp/w[0-9]*\.sh' > /tmp/v76.cron
+    if [ "$(grep -c 'ts-watchdog' /tmp/v76.cron)" -ge 1 ]; then crontab /tmp/v76.cron && fixed "cron: убраны диагностические w*.sh (сторожа сохранены)"; fi
+    rm -f /tmp/v76.cron
+fi
+_nft_dns=$(nft list ruleset 2>/dev/null | grep -cE 'force-DNS-to-router|redirect to :53')
+if [ "$_nft_dns" -gt 0 ]; then
+    warn "nft: ПЕРЕХВАТ DNS на LAN ($_nft_dns правил) — рубит LuCI/SSH! Снять redirect :53, затем firewall reload"
+else
+    echo "  ✅ nft: опасного перехвата DNS нет"
 fi
 
 # ── 10. Итог ───────────────────────────────────────────────────────────────

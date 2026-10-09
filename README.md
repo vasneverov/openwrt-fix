@@ -170,7 +170,7 @@ sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix
 
 ---
 
-## fix-tailscale-openwrt.sh v7.4 — «ЭТАЛОН 03.10» + щит Tailscale (актуальная версия)
+## fix-tailscale-openwrt.sh v7.6 — «безопасность доступа» + щит Tailscale (актуальная версия)
 
 Тот же спасительный скрипт, та же команда. Безопасный режим: **без перезапусков и без ребута**, файлы эталона ставятся
 только если установленная версия **старее** (бэкап заменённого — `/root/rescue-v7-<дата>/`).
@@ -181,9 +181,16 @@ sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix
 RESTART=1 sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 ```
 
-
 **⛔ Железное правило: Tailscale не ломать никакими правками.** Демон `tailscaled` скрипт не останавливает и не перезапускает. «Щит Tailscale»: статус и pid до и после; если Tailscale был `Running`, а после правок нет — через 80 с скрипт сам откатывает файлы этого запуска из бэкапа и зовёт `ts-watchdog`. Ребут скрипт не делает никогда.
 
+**v7.6 (09.10.2026):**
+- **3.8. Безопасность доступа — `dropbear`: `MaxAuthTries=6`, `IdleTimeout=120`.** Причина «SSH и LuCI пропали и вернулись сами»: dropbear рубит соединение на **3-й неудачной авторизации** (`Max auth tries reached`). При плотной работе/медленном пути через DERP-релей заходы обрывались → доступ пропадал на 20-30 с. Теперь бан на 3 опечатках доступ не вырубит. Idempotent.
+- **5.95. Чистка следов:** убирает диагностический мусор (`/tmp/w*.sh`, `/tmp/*.log`, cron-строки `w*.sh`). Полезные бэкапы в `/root` НЕ трогает.
+- **Проверка недопустимого nft-перехвата DNS** (`redirect :53` / `iifname br-lan`) — он заворачивает DNS клиентов и **рубит LuCI/rpcd** (наш урок ночи 09.10, z56-68).
+- **⚠️ СТОП-ФАКТ:** НЕ импровизировать nft-перехват DNS + DoT/DoH-отказ на LAN — это убивает доступ (LuCI/SSH). **QUIC-блок (`udp dport 443 reject` в `raw_prerouting`) — безопасен и полезен**, только его и стоит ставить.
+- Проверено: **z56-68** (Андрей Тиханов) — `MaxAuthTries=6` применён, следы убраны, доступ стабилен, Tailscale не тронут.
+
+**v7.5 (08.10.2026):** «часы при загрузке» (P1 NTP по IP, P2 hotplug ntp 30-ts-sync, P3 rc.local ждёт NTP) — Tailscale на загрузке `Running` ~24 с вместо ~107 с (s78-39-karpin).
 
 **v7.4:** в заголовке выводится имя роутера из панели Tailscale.
 

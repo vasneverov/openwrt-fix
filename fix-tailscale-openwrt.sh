@@ -2,12 +2,13 @@
 # OpenWrt Router Config Fix — Universal Rescue Script
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
 #
+# v7.7 — 2026-10-10: ЭТАЛОН ПАРИТЕТА Mac↔чат: встроены ts-watchdog v6.8 (ложная тревога «not running» + общий кулдаун рестартов), forkop-watchdog v2.2 (проверка перехвата fakeip tproxy 198.18.0.0/15), сторож доменов v3.1 (+исключение секции social); маркеры 'ts-watchdog v6.8' / 'ПЕРЕХВАТ fakeip' / 'SOCIAL='.
 # v7.6 — 2026-10-09: +3.8 БЕЗОПАСНОСТЬ ДОСТУПА (dropbear MaxAuthTries 3→6 + IdleTimeout 120 — бан на 3 опечатках
 #        вырубал SSH/LuCI; нашёл при ночном разборе z56-68: «SSH и LuCI пропали и вернулись сами»);
 #        +5.95 ЧИСТКА СЛЕДОВ (мои диагностические .log/w*.sh из /tmp, cron w*.sh — иначе диагностика копится);
 #        +ПРОВЕРКА: недопустимый nft-перехват DNS на LAN (redirect :53/iifname br-lan) — рубит LuCI/rpcd.
 #        ⚠️ СТОП-ФАКТ: НЕ импровизировать nft-перехват DNS + DoT/DoH-отказ (убивает доступ; QUIC-блок — ок).
-# v7.5 — 2026-10-08: +5.9 «часы при загрузке» (P1 NTP по IP, P2 hotplug ntp 30-ts-sync, P3 rc.local ждёт NTP) — Tailscale на загрузке Running ~24 с вместо ~107 с (s78-39-karpin).
+# v7.5 — 2026-10-08: +5.9 «часы при загрузке» (P1 NTP по IP, P2 hotplug ntp 30-ts-sync, P3 rc.local ждёт NTP) — Tailscale на загрузке Running ~24 с вместо ~107 с (s78-39).
 # v7.4 — 2026-10-03  «ЭТАЛОН 03.10» + ЩИТ TAILSCALE (v7.4: `opkg update`/`apk update` перед установкой zram — без него на opkg-роутерах zram не ставился) (всё, что накоплено с 07.09 по 03.10.2026)
 #   Принцип: файлы эталона ставятся ТОЛЬКО если установленная версия СТАРШЕ (новее/равное не трогаем,
 #   бэкап заменённого — /root/rescue-v7-<дата>/). Без перезапусков сервисов и без ребута.
@@ -415,6 +416,8 @@ fi
 # 5.2 ts-watchdog v6.6
 cat > /tmp/v7.tswd << 'V7_TSWD'
 #!/bin/sh
+# ts-watchdog v6.8 — 09.10.2026: false-alarm guard for "not running" (3 checks over ~12 s) + one shared restart cooldown (120/300/900 s by reason)
+# ts-watchdog v6.7 — 08.10.2026: cooldown 15 min for the "offline" restart (restart loop kept the dot grey)
 # ts-watchdog v6.6 — 02.10.2026: tailscale up --hostname sanitized (tailscale 1.102.x rejects "_" in DNS labels: VasyaOnline_NN)
 # ts-watchdog v6.5 — 02.10.2026: +oom_score_adj=-900 for tailscaled (boot memory peak OOM-killed tailscaled on 233 MB routers)
 # ts-watchdog v6.4 — 02.10.2026: +wedged-daemon check, +AutoUpdate re-off after restart (CLI cannot reach tailscaled after network reload / forkop restart)
@@ -482,36 +485,48 @@ restart_ts() {
     logger -t ts-watchdog "tailscaled restarted"
 }
 
+# v6.8 (09.10.2026): ONE shared cooldown for every restart reason ($1 = min seconds since the last restart). Stamps the file when allowed.
+may_restart() { NOW=$(date +%s); LAST=$(cat /tmp/ts-wd-last-restart 2>/dev/null || echo 0); [ $((NOW-LAST)) -ge "$1" ] && { echo "$NOW" > /tmp/ts-wd-last-restart; return 0; }; return 1; }
+
 TS_STATUS=$(tailscale status --self=true --peers=false 2>&1 | head -1)
 
 # 1. tailscaled alive check
 if ! pgrep tailscaled > /dev/null 2>&1; then
-    restart_ts "tailscaled not running, restarting..."
+    # v6.8: confirm 3x over ~12 s — pgrep can come back empty under load/migration (30-lensloboda2 14:22: false alarm)
+    for _i in 1 2 3; do sleep 4; pgrep tailscaled > /dev/null 2>&1 && break; done
+    if pgrep tailscaled > /dev/null 2>&1; then
+        logger -t ts-watchdog "false alarm: tailscaled is running (pgrep was empty once)"
+    elif may_restart 120; then
+        restart_ts "tailscaled not running (confirmed 3x), restarting..."
+    fi
     rm -f "$LOCKFILE"; exit 0
 fi
 
 # 2. NoState check
 if echo "$TS_STATUS" | grep -q "NoState"; then
-    restart_ts "NoState, full restart..."
+    may_restart 300 && restart_ts "NoState, full restart..."
     rm -f "$LOCKFILE"; exit 0
 fi
 
 # 2b. v6.4: tailscaled process alive but CLI cannot reach it (wedged after wifi/network reload or forkop restart)
 if echo "$TS_STATUS" | grep -q "failed to connect to local tailscaled"; then
-    restart_ts "daemon wedged (CLI cannot connect), restarting..."
+    sleep 5; tailscale status --self=true --peers=false 2>&1 | head -1 | grep -q "failed to connect to local tailscaled" && may_restart 300 && restart_ts "daemon wedged (CLI cannot connect, confirmed), restarting..."
     rm -f "$LOCKFILE"; exit 0
 fi
 # 3. offline при живом интернете — netmap timeout (v6.3)
 if echo "$TS_STATUS" | grep -q "offline"; then
     if ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
-        restart_ts "offline but internet OK (netmap timeout), restarting..."
-        rm -f "$LOCKFILE"; exit 0
+        # v6.7/v6.8: not more than one "offline" restart per 15 min (x46-21: 4 restarts in 8 min kept the dot grey)
+        if may_restart 900; then
+            restart_ts "offline but internet OK (netmap timeout), restarting..."
+            rm -f "$LOCKFILE"; exit 0
+        fi
     fi
 fi
 
 rm -f "$LOCKFILE"
 V7_TSWD
-put /etc/ts-watchdog.sh /tmp/v7.tswd 'ts-watchdog v6.6'
+put /etc/ts-watchdog.sh /tmp/v7.tswd 'ts-watchdog v6.8'
 
 # 5.3 forkop-часть (для podkop — только предупреждение: podkop устарел, мигрировать на forkop)
 if [ "$VPN_TYPE" = "forkop" ]; then
@@ -607,9 +622,18 @@ SL=$(uci get forkop.main.sort_by_latency 2>/dev/null)
 # 6) tproxy-модуль (без него форкоп не стартует)
 lsmod 2>/dev/null | grep -q nft_tproxy || { modprobe nft_tproxy 2>/dev/null; logger -t forkop-watchdog "nft_tproxy загружен"; }
 
+# 7) ПЕРЕХВАТ fakeip: правило tproxy для 198.18.0.0/15 должно висеть на LAN-интерфейсе.
+#    v2.2 (09.10.2026, z56-68): LAN-DNS отдавал fakeip, но правила перехвата не было → клиенты мимо
+#    тоннеля, а сторож молчал (проверял только DNS). Теперь проверяем и сам перехват.
+if ! nft list ruleset 2>/dev/null | grep -q 'daddr 198.18.0.0/15'; then
+  logger -t forkop-watchdog "🔴 НЕТ tproxy-правила для fakeip — клиенты мимо тоннеля, forkop restart"
+  echo "$(date '+%F %T') БОЛЕЗНЬ: нет правила tproxy для 198.18.0.0/15 — restart" >> $LOG
+  wd_restart
+fi
+
 exit 0
 V7_FKWD
-put /etc/forkop-watchdog.sh /tmp/v7.fkwd 'boot grace'
+put /etc/forkop-watchdog.sh /tmp/v7.fkwd 'ПЕРЕХВАТ fakeip'
 cat > /tmp/v7.hp << 'V7_HP'
 #!/bin/sh
 # 30-vpn v2 (02.10.2026): restart forkop when WAN comes back UP while running, but NOT during boot
@@ -646,6 +670,8 @@ staticpop.net www.kino.pub"
 AI="openai.com chatgpt.com oaistatic.com oaiusercontent.com sora.com anthropic.com claude.ai claude.com claudeusercontent.com \
 statsig.com statsigapi.net featuregates.org featureassets.org prodregistryv2.org"
 
+SOCIAL="instagram.com cdninstagram.com fbcdn.net igcdn.com instagr.am ig.me telegram.org t.me telegram.me telesco.pe tdesktop.com telegra.ph cdn-telegram.org telegram.dog tg.dev"
+
 norm() { printf '%s\n' $* | grep -v '^$' | sort -u | tr '\n' ' '; }
 without() { # $1=list $2=exclude
   for d in $1; do case " $2 " in *" $d "*) ;; *) printf '%s ' "$d";; esac; done
@@ -662,6 +688,7 @@ CHANGED=0
 EXCL=""
 [ "$ENG" = forkop ] && [ "$(uci -q get forkop.kino)" = "section" ] && EXCL="$KINO"
 [ "$ENG" = forkop ] && [ "$(uci -q get forkop.ai)" = "section" ] && EXCL="$EXCL $AI"
+[ "$ENG" = forkop ] && [ "$(uci -q get forkop.social)" = "section" ] && EXCL="$EXCL $SOCIAL"
 if [ "$ENG" = forkop ] && [ -n "$EXCL" ]; then
   NEW_MAIN=$(norm $(without "$CUR $REQUIRED" "$EXCL"))
   if [ "$(uci -q get forkop.kino)" = "section" ]; then
@@ -685,7 +712,7 @@ uci commit $ENG
 /etc/init.d/dnsmasq restart >/dev/null 2>&1
 exit 0
 V7_GUARD
-put /etc/forkop-domain-guard.sh /tmp/v7.guard 'guard.sh v3'
+put /etc/forkop-domain-guard.sh /tmp/v7.guard 'SOCIAL='
 cat > /tmp/v7.fl << 'V7_FL'
 #!/bin/sh
 # forkop-fix-lists.sh — БЕЗОПАСНОЕ обновление списков (замена 62-байтной заглушки)
@@ -781,7 +808,7 @@ done
 if [ "$(uci -q get forkop.ai)" = "section" ]; then
     FIRSTSEC=$(uci show forkop 2>/dev/null | grep -E '=section$' | head -1 | cut -d= -f1)
     if [ "$FIRSTSEC" != "forkop.ai" ]; then uci reorder forkop.ai=0; FK_CHANGED=1; fixed "секция ai поставлена ПЕРВОЙ (правило main с Cloudflare-диапазонами больше не перехватит ИИ)"; fi
-    _MD=$(uci -q get forkop.main.domain | tr -d "\047\042"); _ND=""   # 07.10.2026: strip quotes (a one-element uci list prints as 'a b c' -> literal quotes broke the forkop validator, z56-55-murashkin)
+    _MD=$(uci -q get forkop.main.domain | tr -d "\047\042"); _ND=""   # 07.10.2026: strip quotes (a one-element uci list prints as 'a b c' -> literal quotes broke the forkop validator, z56-55)
     for _d in $_MD; do case " openai.com chatgpt.com oaistatic.com oaiusercontent.com sora.com anthropic.com claude.ai claude.com claudeusercontent.com statsig.com statsigapi.net featuregates.org featureassets.org prodregistryv2.org " in *" $_d "*) ;; *) _ND="$_ND $_d";; esac; done
     _ND=$(echo $_ND)
     if [ "$_ND" != "$(echo $_MD)" ]; then uci set forkop.main.domain="$_ND"; FK_CHANGED=1; fixed "main.domain: ИИ-домены убраны ($(echo $_MD | wc -w) → $(echo $_ND | wc -w))"; fi
@@ -833,11 +860,11 @@ if [ "$(cat /proc/sys/vm/overcommit_memory 2>/dev/null)" != "1" ]; then
     fixed "vm.overcommit_memory=1 (+/etc/sysctl.d/99-forkop-mem.conf)"
 else echo "  ✅ vm.overcommit_memory=1"; fi
 
-# 5.9 ЧАСЫ ПРИ ЗАГРУЗКЕ (08.10.2026, s78-39-karpin: Tailscale Running 107 с → ~24 с): P1 NTP по IP, P2 hotplug ntp 30-ts-sync, P3 rc.local ждёт NTP.
+# 5.9 ЧАСЫ ПРИ ЗАГРУЗКЕ (08.10.2026, s78-39: Tailscale Running 107 с → ~24 с): P1 NTP по IP, P2 hotplug ntp 30-ts-sync, P3 rc.local ждёт NTP.
 #     Только файлы/uci, без перезапуска Tailscale/форкопа/сети; вступает при следующей загрузке. Подробно: references/TAILSCALE-ETALON-HELPERS-AND-BOOT-CLOCK-2026-10-08.md
 cat > /tmp/ts-boot-clock-fix.sh <<'TSBCF_EOF'
 #!/bin/sh
-# ts-boot-clock-fix.sh [--check] — лечение «нестабильного старта Tailscale из-за часов» (08.10.2026, проверено на s78-39-karpin: TS Running 107 с → ~24–35 с).
+# ts-boot-clock-fix.sh [--check] — лечение «нестабильного старта Tailscale из-за часов» (08.10.2026, проверено на s78-39: TS Running 107 с → ~24–35 с).
 # Запуск на роутере:  ssh root@R 'sh -s -- --check' < ts-boot-clock-fix.sh    (чтение)     ·    ssh root@R 'sh -s' < ts-boot-clock-fix.sh   (применить)
 # Причина: у роутера нет RTC, sysfixtime ставит часы на mtime самого свежего файла /etc, rc.local стартует tailscaled до WAN/NTP → NoState до сторожа.
 # Что делает (идемпотентно, файлами, БЕЗ перезапуска Tailscale/форкопа/сети, с бэкапом, sh -n до замены, щит TS до/после):

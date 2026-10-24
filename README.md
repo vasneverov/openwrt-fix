@@ -5,6 +5,77 @@
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-24.10_|_25.12-00ff00)](https://openwrt.org)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue)](LICENSE)
 
+---
+
+## 🚑 `fix-tailscale-openwrt.sh` — **v8.0 «ЭТАЛОН 24.10»** (2026-10-24)
+
+Универсальный спасательный скрипт: приводит роутер к эталону, не ломая Tailscale.
+
+```bash
+# обычный прогон (без рестартов)
+sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
+
+# с применением UCI-правок форкопа (ОДИН рестарт в конце)
+RESTART=1 sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
+
+# удалённо, когда на роутере нет интернета/DNS
+cat fix-tailscale-openwrt.sh | ssh root@IP 'RESTART=1 sh -s'
+```
+
+### Что делает v8.0 (разделы — искать по номерам в скрипте)
+
+| # | Раздел | Суть |
+|---|---|---|
+| [2] | **Tailscale** | ts-watchdog v6.8 · rc.local (userspace-networking, oom_score_adj −900, autoupdate off, hostname без `_`) · hotplug 30-vpn v2 · **ЩИТ TAILSCALE**: был Running → перестал → автооткат файлов |
+| [3] | **Сторожа + cron** | ts-watchdog `*/2` · forkop-watchdog v2.2 `*/2` (ловит потерю tproxy-перехвата fakeip `198.18.0.0/15`) · сторож доменов v3.1 (+social) · blackbox · boot-forensics |
+| [4] | **DNS-АВТОВЫБОР** ⭐ | Проверка портов **по факту**, не догадкой: UDP:53 → `udp` · UDP закрыт + DoT:853 → `dot` · иначе DoH:443 → `doh` · всё закрыто → warning. **Раньше было жёстко `doh`** — ломало провайдеров, где DoH режется, а DoT живёт |
+| [5] | **dnsmasq** ⭐ | `add_list server=127.0.0.42` — **было `uci set`, что на list-опции ОБНУЛЯЕТ список** · `noresolv=1` только если `127.0.0.42` реально отвечает · `rebind_protection=0` для fakeip |
+| [5.6a] | **Секция `youtube`** ⭐ | Создаётся по эталону: 12 полей + urltest (name YouTube, url youtube.com, check 1m, tolerance 100, testing_url captive.apple.com, idle 30m, interrupt 1, pin 1). **Без неё роутер НЕ эталон** |
+| [5.6b] | **Правило №8** ⭐ | Сервисы проверки IP в `main.domain`: `2ip.ru ipinfo.io ifconfig.me myip.ru ip-api.com ipwho.is whatismyipaddress.com ip.sb checkip.amazonaws.com`. Без них клиент видит РФ-город → «VPN не работает» |
+| [5.6c] | **Правило №9** ⭐ | **Пустая секция (`enabled=1`, подписок `0`) роняет ВЕСЬ форкоп**: `[fatal] connection section has no usable outbounds` → `running:0`. Скрипт находит и ставит `enabled=0` |
+| [5.6d] | **Секция `ai`** | Ставится ПЕРВОЙ, ИИ-домены убираются из `main` (иначе Cloudflare-диапазоны перехватывают `claude.ai` → «Sorry, you have been blocked») |
+| [5.8] | **filter_aaaa** | По версии sing-box: ≥1.13 → `1`, иначе удалить |
+| [5.9] | **Часы при загрузке** | NTP по IP (P1) · hotplug `30-ts-sync` (P2) · rc.local ждёт NTP (P3) → Tailscale Running ~24 с вместо ~107 с |
+| [5.95] | **Чистка следов** | Диагностические `/tmp/*.log`, cron `w*.sh` · проверка опасного nft-перехвата DNS на LAN (`redirect :53`, `iifname br-lan`) — рубит LuCI/rpcd |
+| [6] | **Доступ** | dropbear `MaxAuthTries 3→6`, `IdleTimeout 120` — 3 опечатки пароля больше не банят SSH/LuCI |
+| [7] | **Прочее** | Пояс `Europe/Moscow` · GitHub-CDN в `hosts` · `zram-swap` если места хватает |
+| [10] | **Итог** | Дерево ИСПРАВЛЕНО / НЕДОЧЁТЫ + снимок (ts, forkop, srs, crond) |
+
+### ⛔ Чего скрипт НЕ делает (намеренно)
+
+- **НЕ создаёт подписки** — только форму секций (URL владельца нужны отдельно)
+- **НЕ трогает tailscaled на лету**: ни `stop`, ни `restart`, ни `tailscale up/down`, ни `kill`
+- **НЕ делает ребут** — никогда
+- **НЕ импровизирует** nft-перехват DNS + отказ от DoT/DoH (убивает доступ)
+
+### ⛔ Железные правила, зашитые в логику
+
+| № | Правило | Где в коде |
+|---|---|---|
+| №8 | Сервисы проверки IP в `main.domain` | [5.6b] |
+| №9 | Пустая секция роняет форкоп | [5.6c] |
+| №10 | `opkg/apk update` только при `free -m` available > 60 МБ | проверка памяти |
+| TS | Tailscale не ломать никакими правками + Щит с автооткатом | [2] |
+
+### Флаги
+
+| Флаг | Действие |
+|---|---|
+| `RESTART=1` | ОДИН `/etc/init.d/forkop restart` в конце (UCI-правки вступают в силу) |
+| `DRY=1` | Показать, что было бы сделано, ничего не менять |
+
+### Что НЕ покрывает — делается отдельными скриптами
+
+```bash
+# полный эталон роутера с подписками (19 шагов, ~5 мин)
+SKIP_9C=1 REMOTE=1 bash tools/etalon-wired-full.sh <IP> 56756789
+
+# партийная доводка (23 .srs поштучно + сторожа + cron)
+SRS_DIR=tools/offline-forkop/srs bash tools/park-batch.sh <IP> <имя>
+```
+
+---
+
 ## Что это
 
 Установщик Podkop (прокси-туннелирование) с **тонким sing-box** вместо полного.  

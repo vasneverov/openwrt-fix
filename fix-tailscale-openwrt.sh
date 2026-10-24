@@ -1,15 +1,80 @@
 #!/bin/sh
 # OpenWrt Router Config Fix — Universal Rescue Script
 # Usage: sh <(wget -O - https://raw.githubusercontent.com/vasneverov/openwrt-fix/main/fix-tailscale-openwrt.sh)
+#        или удалённо:  cat fix-tailscale-openwrt.sh | ssh root@IP 'RESTART=1 sh -s'
 #
-# v7.7 — 2026-10-10: ЭТАЛОН ПАРИТЕТА Mac↔чат: встроены ts-watchdog v6.8 (ложная тревога «not running» + общий кулдаун рестартов), forkop-watchdog v2.2 (проверка перехвата fakeip tproxy 198.18.0.0/15), сторож доменов v3.1 (+исключение секции social); маркеры 'ts-watchdog v6.8' / 'ПЕРЕХВАТ fakeip' / 'SOCIAL='.
-# v7.6 — 2026-10-09: +3.8 БЕЗОПАСНОСТЬ ДОСТУПА (dropbear MaxAuthTries 3→6 + IdleTimeout 120 — бан на 3 опечатках
-#        вырубал SSH/LuCI; нашёл при ночном разборе z56-68: «SSH и LuCI пропали и вернулись сами»);
-#        +5.95 ЧИСТКА СЛЕДОВ (мои диагностические .log/w*.sh из /tmp, cron w*.sh — иначе диагностика копится);
-#        +ПРОВЕРКА: недопустимый nft-перехват DNS на LAN (redirect :53/iifname br-lan) — рубит LuCI/rpcd.
-#        ⚠️ СТОП-ФАКТ: НЕ импровизировать nft-перехват DNS + DoT/DoH-отказ (убивает доступ; QUIC-блок — ок).
-# v7.5 — 2026-10-08: +5.9 «часы при загрузке» (P1 NTP по IP, P2 hotplug ntp 30-ts-sync, P3 rc.local ждёт NTP) — Tailscale на загрузке Running ~24 с вместо ~107 с (s78-39).
-# v7.4 — 2026-10-03  «ЭТАЛОН 03.10» + ЩИТ TAILSCALE (v7.4: `opkg update`/`apk update` перед установкой zram — без него на opkg-роутерах zram не ставился) (всё, что накоплено с 07.09 по 03.10.2026)
+# ══════════════════════════════════════════════════════════════════════════════
+#  v8.0 — 2026-10-24 «ЭТАЛОН 24.10» (переписан по итогам аварии 23–24.10.2026)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+#  ЧТО ЭТОТ СКРИПТ ДЕЛАЕТ (полный список разделов — искать по номерам):
+#
+#  [1]   ИНИЦИАЛИЗАЦИЯ: бэкап /root/rescue-v8-<дата>/, логи /tmp/v7.fixed|issues
+#  [2]   Tailscale: ts-watchdog v6.8, rc.local (userspace-networking, oom_score_adj -900,
+#        autoupdate off, hostname без «_»), hotplug 30-vpn v2, ЩИТ TAILSCALE (автооткат
+#        файлов, если TS был Running и перестал)
+#  [3]   СТОРОЖА + CRON: ts-watchdog (*/2), forkop-watchdog v2.2 (*/2, ловит tproxy-перехват
+#        fakeip 198.18.0.0/15), сторож доменов v3.1 (+social), blackbox, boot-forensics
+#  [4]   DNS-АВТОВЫБОР ⭐ НОВОЕ 24.10: проверка портов ПО ФАКТУ, не догадкой:
+#          1) UDP:53 открыт      → dns_type=udp   (быстро, обычные провайдеры)
+#          2) UDP:53 закрыт, DoT → dns_type=dot   (s78-37-veta: UDP53 закрыт ПОЛНОСТЬЮ)
+#          3) DoT закрыт, DoH    → dns_type=doh   (МТС иногда)
+#          4) всё закрыто        → оставить как есть + WARNING
+#        ⛔ Было ЖЁСТКО 'doh' — ломало провайдеров, где DoH режется, а DoT живёт.
+#  [5]   DNSMASQ ⭐ ИСПРАВЛЕНО 24.10: `add_list server=127.0.0.42` (БЫЛО `uci set` — на
+#        list-опции ОБНУЛЯЕТ список!). noresolv=1 ставится ТОЛЬКО если 127.0.0.42 реально
+#        отвечает (иначе клиенты остались бы без DNS). rebind_protection=0 для fakeip.
+#  [5.6a] СЕКЦИЯ youtube ⭐ НОВОЕ: создаётся по эталону tr30-05-serebritsa —
+#        12 полей + urltest (name YouTube, url youtube.com, check 1m, tolerance 100,
+#        testing_url captive.apple.com, idle 30m, interrupt 1, pin 1, filter disabled).
+#        Правило 000-Г: секции роутера = ai · main · kino · youtube. Без youtube — НЕ эталон.
+#  [5.6b] ПРАВИЛО №8 ⭐ НОВОЕ: сервисы проверки IP в main.domain
+#        (2ip.ru ipinfo.io ifconfig.me myip.ru ip-api.com ipwho.is whatismyipaddress.com
+#         ip.sb checkip.amazonaws.com). Без них клиент видит РФ-город → «VPN не работает».
+#  [5.6c] ПРАВИЛО №9 ⭐ НОВОЕ: ПУСТАЯ СЕКЦИЯ (enabled=1, подписок 0) РОНЯЕТ ВЕСЬ ФОРКОП
+#        `[fatal] connection section has no usable outbounds` → running:0 при живой подписке.
+#        Скрипт находит такие секции и ставит enabled=0.
+#  [5.6d] ИИ: секция ai ПЕРВОЙ, ИИ-домены убираются из main (иначе Cloudflare-диапазоны
+#        в main перехватывают claude.ai/chatgpt.com → «Sorry, you have been blocked»)
+#  [5.8]  filter_aaaa по версии sing-box (>=1.13 → 1, иначе удалить)
+#  [5.9]  ЧАСЫ ПРИ ЗАГРУЗКЕ: P1 NTP по IP, P2 hotplug ntp 30-ts-sync, P3 rc.local ждёт NTP
+#        (Tailscale Running ~24 с вместо ~107 с)
+#  [5.95] ЧИСТКА СЛЕДОВ: диагностические /tmp/*.log, cron w*.sh; ПРОВЕРКА опасного
+#        nft-перехвата DNS на LAN (redirect :53 / iifname br-lan) — рубит LuCI/rpcd
+#  [6]   БЕЗОПАСНОСТЬ ДОСТУПА: dropbear MaxAuthTries 3→6, IdleTimeout 120
+#        (иначе 3 опечатки пароля = бан SSH/LuCI)
+#  [7]   СЕТЬ/ПРОЧЕЕ: пояс Europe/Moscow, GitHub-CDN в hosts, zram-swap если места хватает
+#  [10]  ИТОГ: дерево ИСПРАВЛЕНО / НЕДОЧЁТЫ + снимок состояния (ts, forkop, srs, crond)
+#
+#  ⛔ ЧЕГО СКРИПТ НЕ ДЕЛАЕТ (намеренно):
+#    • НЕ создаёт подписки (нужны URL владельца) — только форму секций
+#    • НЕ трогает tailscaled на лету: ни stop, ни restart, ни tailscale up/down, ни kill
+#    • НЕ делает ребут (никогда)
+#    • НЕ импровизирует nft-перехват DNS + DoT/DoH-отказ (убивает доступ)
+#
+#  ⛔ ЖЕЛЕЗНЫЕ ПРАВИЛА, ЗАШИТЫЕ В ЛОГИКУ (см. PROTOCOL-000-START.md):
+#    №8  — IP-сервисы в main.domain (раздел 5.6b)
+#    №9  — пустая секция роняет форкоп (раздел 5.6c)
+#    №10 — opkg/apk update только при free -m available > 60 МБ (m56-07: 19 МБ → завис)
+#    TS  — Tailscale НЕ ломать никакими правками; Щит с автооткатом
+#
+#  Флаги:
+#    RESTART=1  → ОДИН /etc/init.d/forkop restart в конце (чтобы UCI-правки вступили)
+#    DRY=1      → показать, что было бы сделано, ничего не менять
+#
+#  Принцип: файлы эталона ставятся ТОЛЬКО если установленная версия СТАРШЕ
+#  (новее/равное не трогаем, бэкап заменённого — /root/rescue-v8-<дата>/).
+#
+# ── ИСТОРИЯ ВЕРСИЙ ────────────────────────────────────────────────────────────
+# v7.7 — 2026-10-10: паритет Mac↔чат: ts-watchdog v6.8, forkop-watchdog v2.2
+#        (проверка перехвата fakeip tproxy 198.18.0.0/15), сторож доменов v3.1
+# v7.6 — 2026-10-09: безопасность доступа dropbear (3 опечатки = бан), чистка следов,
+#        проверка опасного nft-перехвата DNS
+# v7.5 — 2026-10-08: часы при загрузке (NTP P1/P2/P3), TS Running 24 с вместо 107 с
+# v7.4 — 2026-10-03: «ЭТАЛОН 03.10» + Щит Tailscale
+# v6.7 — 2026-09-07: эталон форкопа — urltest «Самый лучший», sort_by_latency, meta первый
+# v6.6 — 2026-08-27: REBIND-ФИКС dnsmasq (fakeip 198.18.x режется)
+#
 #   Принцип: файлы эталона ставятся ТОЛЬКО если установленная версия СТАРШЕ (новее/равное не трогаем,
 #   бэкап заменённого — /root/rescue-v7-<дата>/). Без перезапусков сервисов и без ребута.
 #   Для вступления форкоп-правок в силу: RESTART=1 sh <(wget ...)  → ОДИН forkop restart в конце.
@@ -576,11 +641,26 @@ case "$FIP" in
       /etc/init.d/dnsmasq restart >/dev/null 2>&1
     fi
     # ЛЕЧЕНИЕ №2: uci-настройка dnsmasq
-    SRV=$(uci get dhcp.@dnsmasq[0].server 2>/dev/null | tr -d ' ')
-    if [ "$SRV" != "127.0.0.42" ]; then
-      echo "$(date '+%F %T') ЛЕЧУ: uci server → 127.0.0.42" >> $LOG
-      uci set dhcp.@dnsmasq[0].server='127.0.0.42'
-      uci set dhcp.@dnsmasq[0].noresolv='1'
+    # ⛔ 24.10.2026 (s78-37-veta): было `uci set dhcp.@dnsmasq[0].server` — на list-опции
+    #    это ОБНУЛЯЕТ список и оставляет ОДНО значение. Плюс noresolv=1 ставился без
+    #    проверки, что 127.0.0.42 реально живой → если sing-box упал, DNS мёртв у клиентов.
+    #    Теперь: add_list + проверка живучести 42, иначе не трогаем noresolv.
+    SRV=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | tr -d '\n')
+    SRV_HAS42=$(echo "$SRV" | grep -c '127\.0\.0\.42')
+    SB_ALIVE=0
+    dig +short +time=2 +tries=1 captive.apple.com @127.0.0.42 2>/dev/null | grep -qE '^[0-9]+\.' && SB_ALIVE=1
+    if [ "$SRV_HAS42" -eq 0 ] || [ "$SB_ALIVE" -eq 0 ]; then
+      echo "$(date '+%F %T') ЛЕЧУ: dnsmasq add_list server=127.0.0.42 (было: '${SRV:-пусто}', 42_alive=$SB_ALIVE)" >> $LOG
+      # ⛔ НЕ uci set! add_list добавляет, не стирая остальные резолверы
+      uci -q add_list dhcp.@dnsmasq[0].server='127.0.0.42'
+      if [ "$SB_ALIVE" -eq 1 ]; then
+        # 42 отвечает — можно noresolv, иначе клиенты останутся без DNS
+        uci set dhcp.@dnsmasq[0].noresolv='1'
+      else
+        echo "$(date '+%F %T') ⚠️ sing-box на 42 НЕ отвечает — noresolv оставлен как есть, сперва ребутаю forkop" >> $LOG
+      fi
+      uci set dhcp.@dnsmasq[0].rebind_protection='0'
+      uci set dhcp.@dnsmasq[0].rebind_localhost='0'
       uci commit dhcp
       /etc/init.d/dnsmasq restart >/dev/null 2>&1
     fi
@@ -671,6 +751,12 @@ AI="openai.com chatgpt.com oaistatic.com oaiusercontent.com sora.com anthropic.c
 statsig.com statsigapi.net featuregates.org featureassets.org prodregistryv2.org"
 
 SOCIAL="instagram.com cdninstagram.com fbcdn.net igcdn.com instagr.am ig.me telegram.org t.me telegram.me telesco.pe tdesktop.com telegra.ph cdn-telegram.org telegram.dog tg.dev"
+
+# 24.10.2026 (правило 000-Г, секция youtube = ЭТАЛОН как у tr30-05-serebritsa):
+#   Без неё роутер НЕ эталон — YouTube реклама/подсказки идут мимо, а в LuCI нет плашки.
+YOUTUBE="youtube.com youtu.be youtube-nocookie.com youtubekids.com yt.be ytimg.com ggpht.com \
+googlevideo.com youtubei.googleapis.com youtube.googleapis.com doubleclick.net \
+googleadservices.com googlesyndication.com 2mdn.net imasdk.googleapis.com"
 
 norm() { printf '%s\n' $* | grep -v '^$' | sort -u | tr '\n' ' '; }
 without() { # $1=list $2=exclude
@@ -796,7 +882,7 @@ else echo "  ✅ cron: уже канонический"; fi
 
 # 5.6 форкоп UCI-правки (вступят в силу после ОДНОГО forkop restart: RESTART=1)
 SBM=$(sing-box version 2>/dev/null | head -1 | awk '{print $3}' | cut -d. -f2 | grep -o '^[0-9]*'); SBM=${SBM:-0}
-for S in main kino ai stream; do
+for S in main kino ai stream youtube; do
     [ "$(uci -q get forkop.$S)" = "section" ] || continue
     CURFA=$(uci -q get forkop.$S.filter_aaaa)
     if [ "$SBM" -ge 13 ]; then
@@ -805,6 +891,72 @@ for S in main kino ai stream; do
         [ -n "$CURFA" ] && { uci -q delete forkop.$S.filter_aaaa; FK_CHANGED=1; fixed "forkop.$S.filter_aaaa удалён (sing-box 1.$SBM < 1.13: иначе AAAA висят)"; }
     fi
 done
+# ── 5.6a. СОЗДАНИЕ СЕКЦИИ youtube (24.10.2026, ЭТАЛОН tr30-05-serebritsa) ────
+#   Правило 000-Г: секции роутера = ai · main · kino · youtube. Без youtube — НЕ эталон.
+#   Здесь только СОЗДАНИЕ формы (12 полей + urltest). Подписки добавляет парк-скрипт.
+if [ -f /etc/config/forkop ] && [ "$(uci -q get forkop.youtube)" != "section" ]; then
+    uci set forkop.youtube=section
+    uci set forkop.youtube.enabled='1'
+    uci set forkop.youtube.action='connection'
+    uci set forkop.youtube.connection_type='proxy'
+    uci set forkop.youtube.proxy_config_type='url'
+    uci set forkop.youtube.mixed_proxy_enabled='0'
+    uci set forkop.youtube.outbound_detour_enabled='0'
+    uci set forkop.youtube.sort_by_latency='1'
+    uci set forkop.youtube.resolve_real_ip_for_routing='0'
+    uci set forkop.youtube.dashboard_filter_mode='disabled'
+    uci set forkop.youtube.filter_aaaa='1'
+    uci set forkop.youtube.domain="$YOUTUBE"
+    uci set forkop.youtube.community_lists='youtube'
+    _YUT=$(uci add forkop urltest)
+    uci set forkop.$_YUT.section='youtube'
+    uci set forkop.$_YUT.name='YouTube'
+    uci set forkop.$_YUT.url='https://www.youtube.com'
+    uci set forkop.$_YUT.check_interval='1m'
+    uci set forkop.$_YUT.tolerance='100'
+    uci set forkop.$_YUT.testing_url='https://captive.apple.com'
+    uci set forkop.$_YUT.idle_timeout='30m'
+    uci set forkop.$_YUT.interrupt_exist_connections='1'
+    uci set forkop.$_YUT.pin_dashboard='1'
+    uci set forkop.$_YUT.filter_mode='disabled'
+    FK_CHANGED=1
+    fixed "секция youtube СОЗДАНА по эталону (12 полей + urltest) — до этого роутер был НЕ эталон"
+fi
+
+# ── 5.6b. ПРАВИЛО №8: сервисы проверки IP в main.domain (24.10.2026, chankin) ──
+#   Клиент проверяет VPN через 2ip.ru. Нет домена в списках → идёт напрямую →
+#   видит РФ-город → «VPN не работает», хотя туннель жив.
+if [ -f /etc/config/forkop ]; then
+    _MD2=$(uci -q get forkop.main.domain | tr -d "\047\042")
+    _ADDED=""
+    for _d in 2ip.ru ipinfo.io ifconfig.me myip.ru ip-api.com ipwho.is whatismyipaddress.com ip.sb checkip.amazonaws.com; do
+        case " $_MD2 " in
+            *" $_d "*) ;;
+            *) _MD2="$_MD2 $_d"; _ADDED="$_ADDED $_d";;
+        esac
+    done
+    if [ -n "$_ADDED" ]; then
+        uci set forkop.main.domain="$(echo $_MD2)"
+        FK_CHANGED=1
+        fixed "main.domain: добавлены сервисы проверки IP (2ip.ru и др.) — клиент видел РФ-город$_ADDED"
+    fi
+fi
+
+# ── 5.6c. ПРАВИЛО №9: ПУСТАЯ СЕКЦИЯ РОНЯЕТ ФОРКОП (24.10.2026, z56-122-yuri) ──
+#   [fatal] connection section has no usable outbounds → running:0 при живой подписке.
+if [ -f /etc/config/forkop ]; then
+    _EMPTY=""
+    for _s in $(uci show forkop 2>/dev/null | grep -E '=section$' | sed 's/forkop\.//;s/=section//'); do
+        _c=$(uci show forkop 2>/dev/null | grep -cE "subscription_url\[[0-9]+\]\.section='${_s}'")
+        if [ "$_c" -eq 0 ] && [ "$(uci -q get forkop.$_s.enabled)" = "1" ]; then
+            uci set forkop.$_s.enabled='0'
+            FK_CHANGED=1
+            _EMPTY="$_EMPTY $_s"
+        fi
+    done
+    [ -n "$_EMPTY" ] && fixed "пустые секции ОТКЛЮЧЕНЫ (роняли форкоп):$_EMPTY — добавь подписки и включи"
+fi
+
 if [ "$(uci -q get forkop.ai)" = "section" ]; then
     FIRSTSEC=$(uci show forkop 2>/dev/null | grep -E '=section$' | head -1 | cut -d= -f1)
     if [ "$FIRSTSEC" != "forkop.ai" ]; then uci reorder forkop.ai=0; FK_CHANGED=1; fixed "секция ai поставлена ПЕРВОЙ (правило main с Cloudflare-диапазонами больше не перехватит ИИ)"; fi
@@ -1118,20 +1270,47 @@ if [ -f /usr/bin/forkop ]; then
         fi
     fi
 
-    # DNS через DoH, если UDP 53 режется
+    # ── 4.x. DNS-АВТОВЫБОР (24.10.2026, s78-37-veta, m56-11-chankin) ─────────
+    #   Провайдеры режут по-разному. Порядок проверки по ФАКТУ, не догадкой:
+    #     1) UDP:53  — если открыт, ставим 'udp' (самое быстрое)
+    #     2) DoT:853 — если открыт, ставим 'dot' (Veta: UDP53 закрыт ПОЛНОСТЬЮ, 853 жив)
+    #     3) DoH:443 — если открыт, ставим 'doh' (МТС иногда)
+    #     4) ничего не открыто — оставляем как есть + WARNING
+    #   ⛔ Раньше было ЖЁСТКО 'doh' — это ломало провайдеров, где DoH режется, а DoT нет.
     if command -v nslookup >/dev/null 2>&1; then
-        dns_udp_ok=$(nslookup example.com 8.8.8.8 2>&1 | grep -cE 'Address' || true)
-        if [ "$dns_udp_ok" -lt 1 ]; then
-            cur_dns=$(uci get forkop.settings.dns_type 2>/dev/null || echo "")
-            if [ "$cur_dns" != "doh" ]; then
-                uci set forkop.settings.dns_type='doh'
-                uci commit forkop
-                echo "  ✅ DNS DoH: UDP 53 режется — dns_type переключён на 'doh' (было '$cur_dns')"
-            else
-                echo "  ✅ DNS DoH: уже 'doh'"
-            fi
+        _dns_probe() {
+            # $1 = IP, $2 = порт. Возвращает 0 если порт отвечает
+            nslookup example.com "$1" >/dev/null 2>&1 && return 0
+            ( echo >/dev/tcp/"$1"/"$2" ) >/dev/null 2>&1 && return 0
+            return 1
+        }
+        DNS_MODE=""
+        # 1) UDP:53 на четырёх резолверах
+        for _r in 1.1.1.1 1.0.0.1 8.8.8.8 9.9.9.9; do
+            if nslookup example.com "$_r" 2>/dev/null | grep -q Address; then DNS_MODE="udp"; break; fi
+        done
+        # 2) UDP:53 закрыт → DoT:853
+        if [ -z "$DNS_MODE" ]; then
+            for _r in 1.1.1.1 1.0.0.1 9.9.9.9 94.140.14.14; do
+                if ( echo >/dev/tcp/"$_r"/853 ) >/dev/null 2>&1; then DNS_MODE="dot"; break; fi
+            done
+        fi
+        # 3) DoT закрыт → DoH:443
+        if [ -z "$DNS_MODE" ]; then
+            for _r in 1.1.1.1 1.0.0.1 9.9.9.9; do
+                if ( echo >/dev/tcp/"$_r"/443 ) >/dev/null 2>&1; then DNS_MODE="doh"; break; fi
+            done
+        fi
+
+        cur_dns=$(uci -q get ${VPN_CONFIG}.settings.dns_type 2>/dev/null || echo "")
+        if [ -n "$DNS_MODE" ] && [ "$cur_dns" != "$DNS_MODE" ]; then
+            uci set ${VPN_CONFIG}.settings.dns_type="$DNS_MODE"
+            uci commit ${VPN_CONFIG}
+            fixed "DNS: провайдер режет UDP53 → dns_type '$cur_dns' → '$DNS_MODE' (по факту проверки портов)"
+        elif [ -n "$DNS_MODE" ]; then
+            echo "  ✅ DNS: dns_type='$DNS_MODE' — совпадает с тем, что провайдер пропускает"
         else
-            echo "  ✅ DNS: UDP 53 работает — DoH не нужен"
+            warn "DNS: ни UDP53, ни DoT853, ни DoH443 не отвечают — провайдер режет всё; оставлен '$cur_dns'"
         fi
     fi
 fi

@@ -516,6 +516,21 @@ echo $$ > "$LOCKFILE"
 # v6.5: keep tailscaled away from the OOM killer (idempotent, every run)
 for p in $(pgrep tailscaled 2>/dev/null); do echo -900 > /proc/$p/oom_score_adj 2>/dev/null; done
 
+# ⛔ v7.7 (26.10.2026, tr56-01-d1): УБИТЬ ДУБЛИ tailscaled — ГЛАВНЫЙ БЛОК
+# БЕЗ НЕГО: cron */2 → watchdog видит "offline" → поднимает ЕЩЁ ОДИН tailscaled
+# → старый жив → ещё один → 18 процессов → драка за tailscaled.state
+# → форкоп падает ([fatal] connection section has no usable outbounds) → клиент без VPN.
+# Симптом: pidof tailscaled возвращает 18 PID.
+NP=$(pgrep tailscaled 2>/dev/null | wc -l)
+if [ "$NP" -gt 1 ]; then
+    for p in $(pgrep tailscaled 2>/dev/null | tail -n +2); do
+        [ "$(cat /proc/$p/comm 2>/dev/null)" = "tailscaled" ] && kill -9 "$p" 2>/dev/null
+    done
+    logger -t ts-watchdog "killed $((NP-1)) duplicate tailscaled (was $NP, now 1)"
+    rm -f "$LOCKFILE"
+    exit 0
+fi
+
 # rc.local восстановление
 if [ ! -f "$RC_BACKUP" ]; then
     logger -t ts-watchdog "rc.local.bak не найден!"
@@ -1333,6 +1348,86 @@ if [ "$_nft_dns" -gt 0 ]; then
     warn "nft: ПЕРЕХВАТ DNS на LAN ($_nft_dns правил) — рубит LuCI/SSH! Снять redirect :53, затем firewall reload"
 else
     echo "  ✅ nft: опасного перехвата DNS нет"
+fi
+
+# ── 9.9 ГРАБЛИ 26.10.2026 (по опыту 79 роутеров: tr56-01-d1, s78-45, m78-18, 56-ayna) ──
+# Каждый блок лечит КОНКРЕТНЫЙ отказ, который сегодня валил клиентов.
+echo ""
+echo "  ── АНТИ-ГРАБЛИ v7.7 ──"
+
+# ⛔ ГРАБЛИ 1: sing-box-variant — форкоп ищет пакет "sing-box", а стоит "sing-box-tiny"
+# Симптом: [error] Package 'sing-box' is not installed. Aborted. (форкоп НЕ стартует)
+if [ ! -f /etc/forkop/sing-box-variant ]; then
+    if (command -v apk >/dev/null 2>&1 && apk list 2>/dev/null | grep -q '^sing-box-tiny.*installed') || \
+       (command -v opkg >/dev/null 2>&1 && opkg list-installed 2>/dev/null | grep -q '^sing-box-tiny'); then
+        echo -n tiny > /etc/forkop/sing-box-variant
+        fixed "sing-box-variant=tiny (форкоп искал пакет sing-box)"
+    fi
+fi
+
+# ⛔ ГРАБЛИ 2: СЕКЦИЯ БЕЗ connection_type/proxy_config_type = «no usable outbounds»
+# Симптом: [error] No compatible subscription request profile ... rule 'ai'
+#          [fatal] Subscription caches are not ready     (при этом подписки качаются 200!)
+# Форкоп не понимает, ЧТО делать с подпиской секции без connection_type='proxy'.
+SEC_FIXED=""
+for S in main ai kino youtube bamboo netflix social stream; do
+    uci -q get "forkop.$S" >/dev/null 2>&1 || continue
+    if [ "$(uci -q get "forkop.$S.action")" = "bypass" ]; then continue; fi
+    [ -z "$(uci -q get "forkop.$S.connection_type")" ]   && { uci set "forkop.$S.connection_type=proxy"; SEC_FIXED="$SEC_FIXED $S:ct"; }
+    [ -z "$(uci -q get "forkop.$S.proxy_config_type")" ] && { uci set "forkop.$S.proxy_config_type=url"; SEC_FIXED="$SEC_FIXED $S:pct"; }
+    [ -z "$(uci -q get "forkop.$S.filter_aaaa")" ]       && { uci set "forkop.$S.filter_aaaa=1"; SEC_FIXED="$SEC_FIXED $S:faaa"; }
+done
+[ -n "$SEC_FIXED" ] && { uci commit forkop; fixed "секции: дозаполнены обязательные поля ($SEC_FIXED)"; }
+
+# ⛔ ГРАБЛИ 3: exclude_regex от мёртвых подписок режет узлы новых
+# Симптом: [fatal] connection section has no usable outbounds (узлы есть, но отсекаются)
+URL_EX=""
+i=0
+while uci -q get "forkop.@urltest[$i]" >/dev/null 2>&1; do
+    if [ -n "$(uci -q get "forkop.@urltest[$i].exclude_regex")" ]; then
+        uci set "forkop.@urltest[$i].filter_mode=disabled"
+        uci -q delete "forkop.@urltest[$i].exclude_regex"
+        URL_EX="$URL_EX $i"
+    fi
+    i=$((i+1))
+done
+[ -n "$URL_EX" ] && { uci commit forkop; fixed "urltest: снят exclude_regex (косяк от мёртвых подписок):$URL_EX"; }
+
+# ⛔ ГРАБЛИ 4: хвосты podkop в dnsmasq — перебивают noresolv
+# Симптом: форкоп стартует, но подписки «не качаются» (DNS клиента сломан)
+PODKOP_TAIL=0
+for F in podkop_noresolv podkop_cachesize podkop_server; do
+    uci -q get "dhcp.@dnsmasq[0].$F" >/dev/null 2>&1 && { uci -q delete "dhcp.@dnsmasq[0].$F"; PODKOP_TAIL=$((PODKOP_TAIL+1)); }
+done
+[ "$PODKOP_TAIL" -gt 0 ] && { uci commit dhcp; fixed "dnsmasq: удалены хвосты podkop ($PODKOP_TAIL)"; }
+
+# ⛔ ГРАБЛИ 5: youtube в main.community_lists — конфликт с секцией youtube
+# uci del_list НЕ всегда срабатывает → пересобираем список циклом
+MC_YT=$(uci -q get forkop.main.community_lists | tr ' ' '\n' | grep -c '^youtube$')
+if [ "${MC_YT:-0}" -gt 0 ]; then
+    _L=$(uci -q get forkop.main.community_lists); _NEW=""
+    for _X in $_L; do [ "$_X" = "youtube" ] || _NEW="$_NEW $_X"; done
+    uci set "forkop.main.community_lists=$(echo $_NEW)"
+    uci commit forkop
+    fixed "main.community_lists: убран youtube (конфликт с секцией)"
+fi
+
+# ⛔ ГРАБЛИ 6: ts-watchdog НЕ В CRON — Tailscale без присмотра
+# Симптом: файл /etc/ts-watchdog.sh есть, но crontab пуст → после ребута TS не поднимется
+if [ -f /etc/ts-watchdog.sh ] && [ "$(crontab -l 2>/dev/null | grep -c ts-watchdog)" -eq 0 ]; then
+    crontab -l > /tmp/cron.v77 2>/dev/null || touch /tmp/cron.v77
+    echo '*/2 * * * * /etc/ts-watchdog.sh >/dev/null 2>&1' >> /tmp/cron.v77
+    crontab /tmp/cron.v77
+    fixed "cron: добавлен ts-watchdog */2 (был 0 — TS без присмотра)"
+fi
+
+# ⛔ ГРАБЛИ 7: ЛАВИНА tailscaled — проверка после всех правок
+TS_N=$(pgrep tailscaled 2>/dev/null | wc -l)
+if [ "$TS_N" -gt 1 ]; then
+    /etc/ts-watchdog.sh >/dev/null 2>&1
+    sleep 2
+    TS_N2=$(pgrep tailscaled 2>/dev/null | wc -l)
+    fixed "лавина tailscaled: было $TS_N → стало $TS_N2 (убиты дубли)"
 fi
 
 # ── 10. Итог ───────────────────────────────────────────────────────────────

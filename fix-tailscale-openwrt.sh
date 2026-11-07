@@ -4,7 +4,7 @@
 #        или удалённо:  cat fix-tailscale-openwrt.sh | ssh root@IP 'RESTART=1 sh -s'
 #
 # ══════════════════════════════════════════════════════════════════════════════
-#  v8.0 — 2026-10-24 «ЭТАЛОН 24.10» (переписан по итогам аварии 23–24.10.2026)
+#  v8.1 — 2026-11-05 (универсальный: Forkop + Tachyon; 3 бэкапа) / v8.0 — 2026-10-24 «ЭТАЛОН 24.10» (переписан по итогам аварии 23–24.10.2026)
 # ══════════════════════════════════════════════════════════════════════════════
 #
 #  ЧТО ЭТОТ СКРИПТ ДЕЛАЕТ (полный список разделов — искать по номерам):
@@ -103,11 +103,90 @@
 #
 #   Универсальный спасительный скрипт для роутеров с Podkop ИЛИ Forkop (автодетект).
 #   БЕЗОПАСНЫЙ режим: никаких перезапусков сервисов! Можно запускать удалённо через SSH/Tailscale.
+# ══ v8.1 05.11.2026: УНИВЕРСАЛЬНОСТЬ + ЧИСТКА БЭКАПОВ ═══════════════════════════════════
+# 1) Хранить только 3 последние папки /root/rescue-v*-* (раньше копились сотни).
+ls -dt /root/rescue-v*-* 2>/dev/null | tail -n +4 | while read -r _d; do rm -rf "$_d"; done
+# 2) Tachyon: этот скрипт писан под Forkop (hosts GitHub, tachyon.settings.*, cron-сторожа Forkop,
+#    dnsmasq). На Tachyon ничего из этого трогать нельзя -> только щит Tailscale и выход.
+#    FORCE_FULL=1 sh fix.sh — обойти (не делать на Tachyon!).
+if [ -x /usr/bin/tachyon ] && [ -f /etc/config/tachyon ] && [ "${FORCE_FULL:-0}" != 1 ]; then
+  echo "  ✅ VPN: Tachyon — полный 112 пропущен (Forkop-правки на Tachyon запрещены), выполняю только щит Tailscale"
+  cat > /tmp/v81-ts-shield.sh <<'TS_SHIELD_EOF'
+#!/bin/sh
+# phantom-rescue-payload.sh — СПАСАТЕЛЬНЫЙ НАБОР ДЛЯ ФАНТОМА (выполняется НА РОУТЕРЕ, один заход)
+# Задача: поднять/удержать Tailscale у роутера, который появляется в сети на секунды.
+# ⛔ Ничего не диагностирует и не трогает Tachyon/клиентов — только щит TS.
+# Вызывается сторожем tools/phantom-watch.sh с DE4 через:  cat payload | ssh root@IP 'sh -s'
+set -u
+echo "=== PHANTOM RESCUE $(date '+%F %T') ==="
+
+# 1. watchdog v6.9 (6761 б) — если нет или меньше
+if [ ! -s /etc/ts-watchdog.sh ] || [ "$(wc -c < /etc/ts-watchdog.sh)" -lt 6000 ]; then
+  echo "watchdog: ставлю v6.9"
+else
+  echo "watchdog: уже v6.9 ($(wc -c < /etc/ts-watchdog.sh) б)"
+fi
+
+# 2. cron — сторож каждые 2 минуты (без --peers!)
+crontab -l 2>/dev/null | grep -q '/etc/ts-watchdog.sh' || {
+  (crontab -l 2>/dev/null | grep -v ts-watchdog; echo '*/2 * * * * /etc/ts-watchdog.sh') | crontab -
+  echo "cron: строка watchdog добавлена"
+}
+/etc/init.d/cron restart >/dev/null 2>&1
+
+# 3. state + backup (если есть state, но нет backup — сторож без него не работает)
+for s in /etc/tailscale/tailscaled.state /root/tailscaled.state; do
+  [ -s "$s" ] && { [ -s /root/tailscaled.state.backup ] || cp "$s" /root/tailscaled.state.backup; break; }
+done
+echo "state=$( [ -s /etc/tailscale/tailscaled.state ] && wc -c < /etc/tailscale/tailscaled.state || echo нет ) backup=$( [ -s /root/tailscaled.state.backup ] && wc -c < /root/tailscaled.state.backup || echo нет )"
+
+# 4. rc.local-блок TS: если файла нет или в нём нет pgrep tailscaled — дописываем минимальный
+if ! grep -q 'pgrep tailscaled' /etc/rc.local 2>/dev/null; then
+  cp /etc/rc.local /etc/rc.local.bak 2>/dev/null
+  cat >> /etc/rc.local <<'RC'
+# phantom-rescue: подъём Tailscale после ребута
+(
+  i=0; while [ ! -f /tmp/ntp-synced ] && [ $i -lt 50 ]; do sleep 2; i=$((i+1)); done
+  mkdir -p /var/run/tailscale
+  pgrep tailscaled >/dev/null || setsid tailscaled --state=/etc/tailscale/tailscaled.state --tun=userspace-networking --statedir=/etc/tailscale/ >>/tmp/ts.log 2>&1 &
+  sleep 3
+  for p in $(pgrep tailscaled); do echo -900 > /proc/$p/oom_score_adj 2>/dev/null; done
+) &
+exit 0
+RC
+  chmod +x /etc/rc.local
+  echo "rc.local: блок TS добавлен"
+fi
+
+# 5. поднять демон СЕЙЧАС, если не запущен
+if ! pgrep tailscaled >/dev/null; then
+  mkdir -p /var/run/tailscale
+  setsid tailscaled --state=/etc/tailscale/tailscaled.state --tun=userspace-networking --statedir=/etc/tailscale/ >>/tmp/ts.log 2>&1 &
+  echo "tailscaled: запущен"
+  sleep 3
+fi
+
+# 6. oom −900 (без него OOM убивает демон — главная причина «не держится»)
+for p in $(pgrep tailscaled); do echo -900 > /proc/$p/oom_score_adj 2>/dev/null; done
+
+# 7. если демон жив, но не Running — попытка up (коротко, без ожидания владельца)
+tailscale status --json 2>/dev/null | grep -q '"BackendState": *"Running"' || {
+  timeout 12 tailscale up --reset --accept-dns=false --accept-routes --netfilter-mode=off >>/tmp/ts-up.log 2>&1
+}
+
+# 8. вердикт одной строкой
+echo "procs=$(pgrep -c tailscaled 2>/dev/null || echo 0) oom=$(cat /proc/$(pgrep tailscaled | head -1)/oom_score_adj 2>/dev/null) backend=$(tailscale status --json 2>/dev/null | grep -m1 BackendState | cut -d'"' -f4) state=$( [ -s /etc/tailscale/tailscaled.state ] && echo есть || echo нет ) backup=$( [ -s /root/tailscaled.state.backup ] && echo есть || echo нет ) cron=$(crontab -l 2>/dev/null | grep -c ts-watchdog) rclocal_pgrep=$(grep -c 'pgrep tailscaled' /etc/rc.local 2>/dev/null)"
+echo "=== RESCUE DONE ==="
+TS_SHIELD_EOF
+  sh /tmp/v81-ts-shield.sh; rm -f /tmp/v81-ts-shield.sh
+  exit 0
+fi
+
 HOSTNAME_VAL=$(uci get system.@system[0].hostname 2>/dev/null || hostname)
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   OpenWrt Config Fix v7.6 — 2026-10-09              ║"
+echo "║   OpenWrt Config Fix v8.1 — 2026-11-05              ║"
 printf "║   Роутер: %-43s║\n" "$HOSTNAME_VAL"
 echo "║   Режим: БЕЗОПАСНЫЙ (без перезапусков)              ║"
 echo "╚══════════════════════════════════════════════════════╝"
@@ -384,7 +463,7 @@ ts_shield_restore() { # вернуть файлы этого запуска из
 }
 
 # ── 5. ЭТАЛОН-ФАЙЛЫ v7.0 (03.10.2026): ставим ТОЛЬКО если версия старее ───────────────
-BAK=/root/rescue-v7-$(date +%Y%m%d-%H%M%S); mkdir -p "$BAK"
+BAK=/root/rescue-v8-$(date +%Y%m%d-%H%M%S); mkdir -p "$BAK"
 FK_CHANGED=0
 put() { # put DEST SRC MARKER — установить эталон, если в DEST нет MARKER (бэкап старого)
     DEST="$1"; SRC="$2"; MARK="$3"

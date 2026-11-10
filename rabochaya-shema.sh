@@ -21,8 +21,9 @@
 #     поменяй четыре строки SUB_* ниже (или передай свои: SUB_CZ4='…' sh <(wget -O - …)).
 #  Режимы:  --check (только посмотреть, ничего не менять) · --only main|youtube|kino|ai · --no-digit
 #
-#  ЗАЩИТЫ: бэкап конфигов · один перезапуск ядра · живой DNS на время старта · замер ДО и ПОСЛЕ ·
-#          если YouTube/Telegram/tproxy стали ХУЖЕ — автоматический откат из бэкапа.
+#  ЗАЩИТЫ: бэкап конфигов · один перезапуск ядра · живой DNS на время старта · состояние ДО и ПОСЛЕ ·
+#          если ядро не поднялось / нет tproxy / клиенты не получают fakeip — автоматический откат из бэкапа.
+#          Замеры сайтов с самого роутера (wget) показываются справочно и откат не вызывают (они неточны).
 # ═══════════════════════════════════════════════════════════════════════════════════════
 
 VER_S="1.0"
@@ -55,7 +56,10 @@ die(){ bad "$*"; say "\n${R}━━ ОСТАНОВЛЕНО ━━ ничего н
 g(){ uci -q get "$1" 2>/dev/null; }
 want(){ [ -z "$ONLY" ] || [ "$ONLY" = "$1" ]; }
 mk(){ [ "$1" = 1 ] && printf '✅' || printf '❌'; }
-m(){ curl -sk -m12 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null; }
+# Везде встроенный wget (он есть на всех роутерах). curl с роутера даёт ложные замеры — не используется.
+# dl URL ФАЙЛ [сек] -> печатает 200 (скачалось) или 000
+dl(){ rm -f "$2"; if wget -q -T ${3:-15} --no-check-certificate -O "$2" "$1" >/dev/null 2>&1; then echo 200; else echo 000; fi; }
+m(){ dl "$1" /dev/null 12; }
 good(){ [ "$1" = 200 ] || [ "$1" = 301 ] || [ "$1" = 302 ]; }
 
 say "${B}╔════════════════════════════════════════════════════════════════╗${N}"
@@ -70,14 +74,16 @@ snap(){ # $1 = подпись, $2 = префикс переменных (pre/pos
   st=$(tachyon get_status 2>/dev/null | tr -d '\n'); case "$st" in *'"running": 1'*) r=1;; *) r=0;; esac
   case "$st" in *'"dns_configured": 1'*) d=1;; *) d=0;; esac
   tp=$(nft list ruleset 2>/dev/null | grep -c tproxy); eval "${p}_run=$r; ${p}_dns=$d; ${p}_tp=$tp"
+  LAN=$(g network.lan.ipaddr | cut -d/ -f1); fip=$(nslookup www.youtube.com "${LAN:-127.0.0.1}" 2>/dev/null | grep -oE '198\.18\.[0-9.]+' | head -1); eval "${p}_fip=\$fip"
   DS=$(g dhcp.$DM.server); NR=$(g dhcp.$DM.noresolv); dnsok=0; [ "$DS" = 127.0.0.42 ] && [ "$NR" = 1 ] && dnsok=1; eval "${p}_dnsok=$dnsok"
   FK=$( (apk list -I 2>/dev/null; opkg list-installed 2>/dev/null) | grep -ciE 'forkop|podkop'); FC=$(grep -E 'forkop|podkop' /etc/crontabs/root 2>/dev/null | grep -vc '^#')
   eval "${p}_fk=$FK; ${p}_fc=$FC"
   eval "yt=\$${p}_yt; tg=\$${p}_tg; ig=\$${p}_ig; wa=\$${p}_wa"
   say "\n  ┌── $1 ──────────────────────────────────────────────"
   say "  │ Tachyon: $([ $r = 1 ] && echo 'работает ✅' || echo 'НЕ работает ❌') · DNS Tachyon: $(mk $d) · tproxy: $tp · dnsmasq: $DS (noresolv=$NR) $(mk $dnsok)"
+  say "  │ $(mk $([ -n "$fip" ] && echo 1 || echo 0)) клиенты получают fakeip для YouTube: ${fip:-НЕТ (DNS слетел в failsafe)}"
   for s in main youtube kino ai; do [ "$(g tachyon.$s)" = section ] && say "  │ секция $s ← [$(g tachyon.$s.outbound_source_refs)]"; done
-  say "  │ $(mk $(good $yt && echo 1 || echo 0)) YouTube $yt   $(mk $(good $tg && echo 1 || echo 0)) Telegram $tg   $(mk $(good $ig && echo 1 || echo 0)) Instagram $ig   $(mk $(good $wa && echo 1 || echo 0)) WhatsApp $wa"
+  say "  │ замер wget с роутера (справочно, не вердикт): YouTube $yt · Telegram $tg · Instagram $ig · WhatsApp $wa"
   say "  │ следы Forkop: пакетов $FK · активных cron-строк $FC $(mk $([ "$FK$FC" = "00" ] && echo 1 || echo 0))"
   say "  └──────────────────────────────────────────────────────────────"
 }
@@ -118,7 +124,7 @@ ask SUB_CZ5V2 "Чехия 1 (cz5v2)"; ask SUB_CZ4 "Чехия 4 (cz4)"; ask SUB_
 NEED_CZ=0; NEED_AI=0
 for s in $SECS; do want $s || continue; case $s in ai) NEED_AI=1;; *) NEED_CZ=1;; esac; done
 chk(){ c=000; n=0; t=0
-  while [ $t -lt 3 ] && [ "$c" != 200 ]; do t=$((t+1)); c=$(curl -sk -m15 -o /tmp/.rs-sub.chk -w '%{http_code}' "$2" 2>/dev/null); if [ -f /tmp/.rs-sub.chk ]; then n=$(wc -c < /tmp/.rs-sub.chk); else n=0; fi; [ "$c" = 200 ] || sleep 2; done
+  while [ $t -lt 3 ] && [ "$c" != 200 ]; do t=$((t+1)); c=$(dl "$2" /tmp/.rs-sub.chk 15); if [ -f /tmp/.rs-sub.chk ]; then n=$(wc -c < /tmp/.rs-sub.chk); else n=0; fi; [ "$c" = 200 ] || sleep 2; done
   rm -f /tmp/.rs-sub.chk
   if [ "$c" = 200 ] && [ "${n:-0}" -gt 100 ]; then ok "$1: отдаётся (http 200, ${n} байт)"; return 0; else bad "$1: http $c, ${n:-0} байт после $t попыток (с этого роутера не отдаётся)"; return 1; fi; }
 FAILSUB=0
@@ -208,23 +214,21 @@ if [ "$RUN" = 1 ] && [ "${TP:-0}" = 0 ]; then warn "tproxy=0 при живом �
 snap "СОСТОЯНИЕ ПОСЛЕ" post
 TSA=$(pgrep -P 1 tailscaled | head -1)
 [ "$TSA" = "$TSB" ] && ok "Tailscale pid не менялся ($TSA)" || warn "Tailscale pid $TSB → $TSA (родной ts-watchdog мог перезапустить демон на время простоя DNS; связь жива)"
-REG=0; [ "$post_ig" = 000 ] && [ "$pre_ig" != 000 ] && REG=1; [ "$post_wa" = 000 ] && [ "$pre_wa" != 000 ] && REG=1
 GOOD=0
-if [ "$post_run" = 1 ] && [ "${post_tp:-0}" -gt 0 ] && [ "$REG" = 0 ]; then
-  { [ "$post_yt" = 200 ] || [ "$pre_yt" != 200 ]; } && { good "$post_tg" || ! good "$pre_tg"; } && GOOD=1; fi
+if [ "$post_run" = 1 ] && [ "${post_tp:-0}" -gt 0 ] && [ -n "$post_fip" ]; then GOOD=1; fi
+[ "$post_dns" = 1 ] || warn "dns_configured=0 у Tachyon (проверь в LuCI)"
 
 # ═════════ 9. Итог ═════════
 step "Итог"
-arrow(){ # имя до после
-  a=$2; b=$3; if good "$b"; then mark=✅; elif good "$a"; then mark=❌; else mark=⚠️; fi; printf "    %-12s %s → %s  %s\n" "$1" "$a" "$b" "$mark"; }
 if [ $GOOD = 1 ]; then
   say "\n  ${W}ДО → ПОСЛЕ:${N}"
-  say "$(arrow YouTube $pre_yt $post_yt)"; say "$(arrow Telegram $pre_tg $post_tg)"; say "$(arrow Instagram $pre_ig $post_ig)"; say "$(arrow WhatsApp $pre_wa $post_wa)"
-  say "    DNS Tachyon  $(mk $pre_dns) → $(mk $post_dns)     следы Forkop  $pre_fk/$pre_fc → $post_fk/$post_fc"
+  say "    Ядро Tachyon     $(mk $pre_run) → $(mk $post_run)      tproxy  $pre_tp → $post_tp"
+  say "    fakeip клиентам  ${pre_fip:-нет} → ${post_fip:-нет}   $(mk $([ -n "$post_fip" ] && echo 1 || echo 0))"
+  say "    DNS Tachyon      $(mk $pre_dns) → $(mk $post_dns)      следы Forkop (пакеты/cron)  $pre_fk/$pre_fc → $post_fk/$post_fc"
+  say "    замер wget (справочно): YouTube $pre_yt→$post_yt · Telegram $pre_tg→$post_tg · Instagram $pre_ig→$post_ig · WhatsApp $pre_wa→$post_wa"
   say "\n  ${G}ИСПРАВЛЕНО:${N}"; sed 's/^/    ✅ /' $FIXED | tee -a $LOG
   if [ -s $ISSUES ]; then say "\n  ${Y}ОБРАТИ ВНИМАНИЕ:${N}"; sed 's/^/    ⚠️  /' $ISSUES | tee -a $LOG; fi
-  [ "$post_yt" != 200 ] && say "    ⚠️  YouTube не 200 (было $pre_yt): проверь в браузере клиента, а не curl с роутера"
-  { good "$post_ig" && good "$post_wa"; } || say "    ⚠️  Instagram/WhatsApp не открываются (было $pre_ig/$pre_wa): список meta мог не скачаться, это отдельная проблема роутера, не схемы"
+  say "    ℹ️  Точная проверка — в браузере клиента (YouTube, Instagram): замеры с самого роутера неточны."
   say "\n  бэкап для отката: /root/tachyon.before_shema.$TS · лог: $LOG · всего $(( $(date +%s) - T0 )) с"
   say "\n${G}╔══════════════════════ СКРИПТ ВЫПОЛНЕН ══════════════════════╗${N}"
   say "${G}║${N}  Выходи из терминала и открывай LuCI → Сервисы → Tachyon:      ${G}║${N}"
@@ -232,11 +236,11 @@ if [ $GOOD = 1 ]; then
   say "${G}╚════════════════════════════════════════════════════════════════╝${N}"
   exit 0
 fi
-bad "стало хуже (run=$post_run tproxy=$post_tp · YouTube $pre_yt→$post_yt · Telegram $pre_tg→$post_tg · Instagram $pre_ig→$post_ig · WhatsApp $pre_wa→$post_wa) — ОТКАТ из бэкапа"
+bad "схема не заработала (ядро=$post_run tproxy=$post_tp fakeip=${post_fip:-нет}) — ОТКАТ из бэкапа"
 cp /root/tachyon.before_shema.$TS /etc/config/tachyon; boot_dns
 tachyon stop >/dev/null 2>&1; sleep 4; TACHYON_SING_BOX_START_VERIFY_TIMEOUT=180 tachyon start >/dev/null 2>&1 &
 wait_run; assert_dns; sleep 8
-say "   после отката: YouTube $(m https://www.youtube.com/) · Telegram $(m https://t.me/) · running=$(tachyon get_status 2>/dev/null | grep -o '"running": *[01]' | grep -o '[01]')"
+say "   после отката: ядро running=$(tachyon get_status 2>/dev/null | grep -o '"running": *[01]' | grep -o '[01]')"
 say "\n${R}╔══════════════ СХЕМА НЕ ПРИМЕНЕНА ══════════════╗${N}"
 say "${R}║${N}  Конфиг возвращён как был. Лог: $LOG   ${R}║${N}"
 say "${R}╚════════════════════════════════════════════════╝${N}"

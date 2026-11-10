@@ -1078,7 +1078,7 @@ echo "  ✅ hosts: GitHub-CDN на месте"
 
 # 5.8 zram-swap (подушка памяти: без неё OOM убивает sing-box/tailscaled на 233 МБ)
 # 07.10.2026 (механизм memory, эталон MEMORY-ZRAM-SWAP-MECHANISM-2026-10-07.md): если zram ЕСТЬ,
-# но размером по дефолту (ram/2048) — увеличить до 256 МБ + алгоритм zstd (сжатие ~3× вместо lzo 2.2×)
+# но размером по дефолту (ram/2048) — задать 128 МБ (было 256, см. правило №137) + алгоритм zstd (сжатие ~3× вместо lzo 2.2×)
 # + vm.overcommit_memory=1 (не даёт ядру убивать sing-box при всплеске). TS не трогаем, ребута нет.
 if ! grep -q zram /proc/swaps 2>/dev/null; then
     FREEKB=$(df -k /overlay 2>/dev/null | awk 'NR==2{print $4}'); FREEKB=${FREEKB:-0}
@@ -1091,14 +1091,19 @@ else echo "  ✅ zram-swap: уже есть"; fi
 # 5.8b РАЗМЕР zram + алгоритм + overcommit (07.10.2026): дефолт ram/2048 мал при 3 секциях → OOM.
 _ZSZ=$(uci -q get system.@system[0].zram_size_mb); _ZAL=$(uci -q get system.@system[0].zram_comp_algo)
 if grep -q zram /proc/swaps 2>/dev/null; then
-    if [ -z "$_ZSZ" ] || [ "$_ZSZ" -lt 256 ] 2>/dev/null; then
+    # 11.11.2026 (правило №137): zram 128 МБ, НЕ 256. zram живёт в той же ОЗУ; на 240-МБ моделях 256 = OOM.
+    if [ "$_ZSZ" != 128 ]; then
         cp /etc/config/system /root/system.bak-zram-$(date +%s) 2>/dev/null
-        uci set system.@system[0].zram_size_mb='256'
+        uci set system.@system[0].zram_size_mb='128'
         case "$(cat /sys/block/zram0/comp_algorithm 2>/dev/null)" in *zstd*) uci set system.@system[0].zram_comp_algo='zstd';; esac
         uci commit system
-        swapoff /dev/zram0 2>/dev/null; /etc/init.d/zram stop 2>/dev/null; sleep 1; echo 1 > /sys/block/zram0/reset 2>/dev/null; sleep 1; /etc/init.d/zram start 2>/dev/null; sleep 3
-        fixed "zram: размер $(cat /sys/block/zram0/disksize 2>/dev/null | awk '{print int($1/1048576)}') МБ, algo $(cat /sys/block/zram0/comp_algorithm 2>/dev/null | tr ' ' '\n' | grep '[' | tr -d '[]')"
-    else echo "  ✅ zram размер задан: ${_ZSZ} МБ"; fi
+        # пересоздать zram сейчас только если занятый swap помещается в свободную ОЗУ, иначе применится после перезагрузки
+        _SU=$(awk '/SwapTotal/{t=$2}/SwapFree/{f=$2}END{print t-f}' /proc/meminfo); _AV=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+        if [ "${_SU:-0}" -lt $(( ${_AV:-0} - 15000 )) ] 2>/dev/null; then
+            swapoff /dev/zram0 2>/dev/null; /etc/init.d/zram stop 2>/dev/null; sleep 1; echo 1 > /sys/block/zram0/reset 2>/dev/null; sleep 1; /etc/init.d/zram start 2>/dev/null; sleep 3
+            fixed "zram: размер $(cat /sys/block/zram0/disksize 2>/dev/null | awk '{print int($1/1048576)}') МБ (было ${_ZSZ:-по умолчанию}), algo $(cat /sys/block/zram0/comp_algorithm 2>/dev/null | tr ' ' '\n' | grep '[' | tr -d '[]')"
+        else warn "zram 128 МБ записан в настройки, но занятый swap (${_SU} КБ) не помещается в свободную ОЗУ: применится после перезагрузки"; fi
+    else echo "  ✅ zram размер задан: 128 МБ"; fi
 fi
 if [ "$(cat /proc/sys/vm/overcommit_memory 2>/dev/null)" != "1" ]; then
     echo 1 > /proc/sys/vm/overcommit_memory 2>/dev/null
